@@ -36,17 +36,22 @@ namespace Mcp\Types;
  *   total?: number
  * }
  */
-class ProgressNotificationParams implements McpModel {
+class ProgressNotificationParams extends NotificationParams {
     use ExtraFieldsTrait;
 
     public function __construct(
         public readonly ProgressToken $progressToken,
         public readonly float $progress,
         public ?float $total = null,
-        public ?string $message = null
-    ) {}
+        public ?string $message = null,
+        ?Meta $_meta = null,
+    ) {
+        parent::__construct($_meta);
+    }
 
     public function validate(): void {
+        parent::validate();
+
         $this->progressToken->validate();
         if ($this->total !== null && $this->total < $this->progress) {
             throw new \InvalidArgumentException('Total progress cannot be less than current progress');
@@ -64,6 +69,13 @@ class ProgressNotificationParams implements McpModel {
         if ($this->message !== null) {
             $data['message'] = $this->message;
         }
-        return array_merge($data, $this->extraFields);
+        $parentData = parent::jsonSerialize();
+        if ($parentData instanceof \stdClass) {
+            $parentData = (array) $parentData;
+        }
+
+        $merged = array_merge($parentData, $data, $this->extraFields);
+
+        return !empty($merged) ? $merged : new \stdClass();
     }
 }
