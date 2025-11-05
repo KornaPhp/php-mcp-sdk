@@ -32,20 +32,34 @@ namespace Mcp\Types;
  * Params for ResourceUpdatedNotification:
  * { uri: string }
  */
-class ResourceUpdatedNotificationParams implements McpModel {
+class ResourceUpdatedNotificationParams extends NotificationParams {
     use ExtraFieldsTrait;
 
     public function __construct(
-        public readonly string $uri
-    ) {}
+        public readonly string $uri,
+        ?Meta $_meta = null,
+    ) {
+        parent::__construct($_meta);
+    }
 
     public function validate(): void {
+        parent::validate();
+
         if (empty($this->uri)) {
             throw new \InvalidArgumentException('Resource URI cannot be empty');
         }
     }
 
     public function jsonSerialize(): mixed {
-        return array_merge(['uri' => $this->uri], $this->extraFields);
+        $data = ['uri' => $this->uri];
+
+        $parentData = parent::jsonSerialize();
+        if ($parentData instanceof \stdClass) {
+            $parentData = (array) $parentData;
+        }
+
+        $merged = array_merge($parentData, $data, $this->extraFields);
+
+        return !empty($merged) ? $merged : new \stdClass();
     }
 }

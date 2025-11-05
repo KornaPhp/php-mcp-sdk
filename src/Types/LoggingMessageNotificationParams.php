@@ -36,16 +36,21 @@ namespace Mcp\Types;
  *   data: unknown;
  * }
  */
-class LoggingMessageNotificationParams implements McpModel {
+class LoggingMessageNotificationParams extends NotificationParams {
     use ExtraFieldsTrait;
 
     public function __construct(
         public readonly LoggingLevel $level,
         public readonly mixed $data,
         public ?string $logger = null,
-    ) {}
+        ?Meta $_meta = null,
+    ) {
+        parent::__construct($_meta);
+    }
 
     public function validate(): void {
+        parent::validate();
+
         if ($this->data === null) {
             throw new \InvalidArgumentException('Logging message data cannot be null');
         }
@@ -59,6 +64,13 @@ class LoggingMessageNotificationParams implements McpModel {
         if ($this->logger !== null) {
             $data['logger'] = $this->logger;
         }
-        return array_merge($data, $this->extraFields);
+        $parentData = parent::jsonSerialize();
+        if ($parentData instanceof \stdClass) {
+            $parentData = (array) $parentData;
+        }
+
+        $merged = array_merge($parentData, $data, $this->extraFields);
+
+        return !empty($merged) ? $merged : new \stdClass();
     }
 }
