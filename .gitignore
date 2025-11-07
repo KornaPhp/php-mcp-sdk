@@ -1,3 +1,9 @@
 # Composer dependencies
 /vendor/
 composer.lock
+
+# PHPUnit cache
+/.phpunit.cache/
+
+# Local PHPUnit config overrides
+/phpunit.xml
