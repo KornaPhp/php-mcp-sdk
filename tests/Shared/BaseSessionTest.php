@@ -382,6 +382,146 @@ final class BaseSessionTest extends TestCase
     }
 
     /**
+     * Test that incoming requests are properly dispatched through RequestResponder.
+     *
+     * Server-side request dispatch flow:
+     * 1. JSON-RPC request message arrives via handleIncomingMessage()
+     * 2. BaseSession validates JSON-RPC version and message type
+     * 3. BaseSession extracts method, params, and request ID
+     * 4. BaseSession creates RequestResponder with extracted data
+     * 5. RequestResponder is passed to registered onRequest handlers
+     * 6. Handler calls responder.sendResponse() to send reply
+     * 7. JSON-RPC response is written with correlated request ID
+     *
+     * This tests the complete server-side request intake and response path,
+     * which is critical for all server functionality. If this path is broken,
+     * servers cannot process ANY client requests.
+     *
+     * The test also validates metadata extraction (_meta field) and proper
+     * response correlation (matching request/response IDs).
+     *
+     * Corresponds to BaseSession.php:266-296 (request dispatch logic)
+     */
+    public function testIncomingRequestDispatchesThroughResponder(): void
+    {
+        $session = new FakeSession();
+        $responseSent = false;
+        $capturedRequest = null;
+        $capturedMeta = null;
+
+        $session->onRequest(function (RequestResponder $responder) use (&$responseSent, &$capturedRequest, &$capturedMeta): void {
+            $capturedRequest = $responder->getRequest();
+            $capturedMeta = $responder->getMeta();
+            $responder->sendResponse(new DummyResult());
+            $responseSent = true;
+        });
+
+        $requestMessage = new JsonRpcMessage(
+            new JSONRPCRequest(
+                jsonrpc: '2.0',
+                id: new RequestId(5),
+                method: 'dummy/request',
+                params: new TestRequestParams(['foo' => 'bar', '_meta' => ['trace' => 'abc']])
+            )
+        );
+
+        $session->processIncoming($requestMessage);
+
+        $this->assertTrue($responseSent, 'Request handler should be invoked');
+        $this->assertSame('dummy/request', $capturedRequest->method);
+        $this->assertSame(['trace' => 'abc'], $capturedMeta?->jsonSerialize());
+        $this->assertCount(1, $session->writtenMessages, 'Response should be written');
+        $this->assertInstanceOf(
+            JSONRPCResponse::class,
+            $session->writtenMessages[0]->message,
+            'Expected a JSON-RPC response to be sent'
+        );
+        $this->assertSame(5, $session->writtenMessages[0]->message->id->getValue(), 'Response should correlate ID');
+    }
+
+    /**
+     * Test that incoming notifications invoke registered handlers without sending responses.
+     *
+     * Notification dispatch flow:
+     * 1. JSON-RPC notification message arrives (no 'id' field)
+     * 2. BaseSession validates JSON-RPC version
+     * 3. BaseSession routes to notification handler path (not request path)
+     * 4. Notification is converted to typed object via fromMethodAndParams()
+     * 5. Registered onNotification handlers are invoked with typed notification
+     * 6. Handlers process notification
+     * 7. NO response is sent (notifications are fire-and-forget per JSON-RPC spec)
+     *
+     * This validates the one-way notification path, which is critical for
+     * events like progress updates, resource changes, and log messages.
+     *
+     * Unlike requests, notifications must NEVER generate responses. This test
+     * verifies that constraint is enforced.
+     *
+     * Corresponds to BaseSession.php:308-320 (notification handling)
+     */
+    public function testIncomingNotificationInvokesRegisteredHandlers(): void
+    {
+        $session = new FakeSession();
+        $receivedMethod = null;
+        $receivedParams = null;
+
+        $session->onNotification(function (DummyIncomingNotification $notification) use (&$receivedMethod, &$receivedParams): void {
+            $receivedMethod = $notification->method;
+            $receivedParams = $notification->params;
+        });
+
+        $notificationMessage = new JsonRpcMessage(
+            new JSONRPCNotification(
+                jsonrpc: '2.0',
+                method: 'notifications/test',
+                params: new TestNotificationParams(['ping' => true])
+            )
+        );
+
+        $session->processIncoming($notificationMessage);
+
+        $this->assertSame('notifications/test', $receivedMethod);
+        $this->assertSame(['ping' => true], $receivedParams);
+        $this->assertCount(0, $session->writtenMessages, 'Notifications should not emit responses');
+    }
+
+    /**
+     * Test that messages with invalid JSON-RPC version are rejected.
+     *
+     * JSON-RPC version validation flow:
+     * 1. Message arrives with jsonrpc field
+     * 2. handleIncomingMessage() calls validateMessage()
+     * 3. validateMessage() checks if jsonrpc === '2.0'
+     * 4. If version is not '2.0', InvalidArgumentException is thrown
+     * 5. Message is rejected without processing
+     *
+     * The JSON-RPC 2.0 specification requires the "jsonrpc" field to be
+     * exactly "2.0". Older versions (1.0, 1.1) or invalid values must be rejected.
+     *
+     * This validation is critical for protocol compliance. Without it, the SDK
+     * might attempt to process messages with incompatible semantics (e.g.,
+     * JSON-RPC 1.0 uses different error codes and lacks batch support).
+     *
+     * Corresponds to BaseSession.php:323-327 (validateMessage)
+     */
+    public function testInvalidJsonRpcVersionRejectsMessage(): void
+    {
+        $session = new FakeSession();
+
+        $invalid = new JsonRpcMessage(
+            new JSONRPCRequest(
+                jsonrpc: '1.0',
+                id: new RequestId(0),
+                method: 'dummy',
+                params: null
+            )
+        );
+
+        $this->expectException(\InvalidArgumentException::class);
+        $session->processIncoming($invalid);
+    }
+
+    /**
      * Use reflection to count response handlers for verification.
      *
      * Response handlers are stored in BaseSession::$responseHandlers (private property).
@@ -427,6 +567,11 @@ final class FakeSession extends BaseSession
             receiveRequestType: DummyIncomingRequest::class,
             receiveNotificationType: DummyIncomingNotification::class
         );
+    }
+
+    public function processIncoming(JsonRpcMessage $message): void
+    {
+        $this->handleIncomingMessage($message);
     }
 
     /**
@@ -520,24 +665,85 @@ final class DummyResult implements \Mcp\Types\McpModel
 }
 
 /**
- * Dummy incoming request for testing.
+ * Test request parameters that wrap arbitrary key-value arrays.
  *
- * Minimal implementation for server-side request handling tests.
+ * This helper allows tests to create request params with any structure
+ * without defining specific typed parameter classes for each test case.
+ * It's used for tests that need flexible parameter structures.
+ */
+final class TestRequestParams extends \Mcp\Types\RequestParams
+{
+    public function __construct(private array $values)
+    {
+        parent::__construct();
+    }
+
+    public function validate(): void {}
+
+    public function jsonSerialize(): mixed
+    {
+        return $this->values ?: new \stdClass();
+    }
+}
+
+/**
+ * Test notification parameters that wrap arbitrary key-value arrays.
+ *
+ * Similar to TestRequestParams but for notifications. Allows tests to
+ * create notification params with flexible structures without defining
+ * typed classes for each test scenario.
+ */
+final class TestNotificationParams extends \Mcp\Types\NotificationParams
+{
+    public function __construct(private array $values)
+    {
+        parent::__construct();
+    }
+
+    public function validate(): void {}
+
+    public function jsonSerialize(): mixed
+    {
+        return $this->values ?: new \stdClass();
+    }
+}
+
+/**
+ * Dummy incoming request for server-side request handling tests.
+ *
+ * This test double implements McpModel to simulate typed requests that
+ * BaseSession creates when processing incoming JSON-RPC request messages.
+ *
+ * It supports:
+ * - Custom method names for testing different request types
+ * - Arbitrary parameter arrays for flexible test data
+ * - Request ID correlation for response matching
+ * - Conversion to JSONRPCRequest for message construction
+ *
+ * Unlike real request types (InitializeRequest, etc.), this class accepts
+ * any method/params combination, making it useful for generic request tests.
  */
 final class DummyIncomingRequest implements \Mcp\Types\McpModel
 {
+    public function __construct(
+        public string $method = '',
+        public array $params = [],
+        public ?RequestId $id = null,
+    ) {}
+
     public static function fromMethodAndParams(string $method, array $params): self
     {
-        return new self();
+        return new self(method: $method, params: $params, id: new RequestId($params['_id'] ?? 1));
     }
 
     public function getRequest(): JSONRPCRequest
     {
+        $requestParams = $this->params ? new TestRequestParams($this->params) : null;
         return new JSONRPCRequest(
             jsonrpc: '2.0',
-            id: new RequestId(1),
-            method: 'dummy',
-            params: null
+            id: $this->id ?? new RequestId(1),
+            method: $this->method,
+            params: $requestParams
         );
     }
 
@@ -550,20 +756,35 @@ final class DummyIncomingRequest implements \Mcp\Types\McpModel
 }
 
 /**
- * Dummy incoming notification for testing.
+ * Dummy incoming notification for notification handling tests.
  *
- * Minimal implementation for notification handling tests.
+ * This test double implements McpModel to simulate typed notifications that
+ * BaseSession creates when processing incoming JSON-RPC notification messages.
+ *
+ * It supports:
+ * - Custom method names for testing different notification types
+ * - Arbitrary parameter arrays for flexible test data
+ * - Conversion to JSONRPCNotification for message construction
+ *
+ * Unlike real notification types (InitializedNotification, etc.), this class
+ * accepts any method/params combination, making it useful for generic notification tests.
  */
 final class DummyIncomingNotification implements \Mcp\Types\McpModel
 {
+    public function __construct(
+        public string $method = '',
+        public array $params = [],
+    ) {}
+
     public static function fromMethodAndParams(string $method, array $params): self
     {
-        return new self();
+        return new self(method: $method, params: $params);
     }
 
     public function getNotification(): JSONRPCNotification
     {
-        return new JSONRPCNotification(jsonrpc: '2.0', method: 'dummy', params: null);
+        $notificationParams = $this->params ? new TestNotificationParams($this->params) : null;
+        return new JSONRPCNotification(jsonrpc: '2.0', method: $this->method, params: $notificationParams);
     }
 
     public function validate(): void {}

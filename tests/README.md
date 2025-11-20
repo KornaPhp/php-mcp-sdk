@@ -76,6 +76,9 @@ This test is critical because if the handshake is broken, clients cannot connect
 - `testSupportsFeatureBatchMessagesReturnsTrueForLatestVersion()` - Tests feature detection
 - `testInitializeRejectsUnsupportedProtocolVersion()` - Validates version rejection
 - `testSupportsFeatureReturnsFalseBeforeInitialization()` - Tests pre-initialization state
+- `testInitializeNegotiatesOlderSupportedProtocolVersion()` - Tests backward compatibility with older protocol versions
+- `testInitializeFailsOnJsonRpcErrorResponse()` - Tests error handling when server returns JSONRPCError during init
+- `testInitializeTimesOutWhenServerNeverResponds()` - Tests timeout detection when server is unresponsive
 
 **Why Critical**: The initialization handshake is the first interaction between client and server. If this fails, no communication can occur.
 
@@ -100,6 +103,8 @@ This test ensures servers can negotiate with clients using different protocol ve
 - `testInitializeAcceptsLatestProtocolVersion()` - Tests happy path (both on latest version)
 - `testInitializeFallsBackToLatestForUnsupportedVersion()` - Validates fallback for unsupported versions
 - `testInitializeReturnsCorrectServerInfo()` - Verifies server metadata in response
+- `testIncomingInitializeMessageFlowsThroughBaseSession()` - Tests full JSON-RPC routing path through BaseSession
+- `testResponsesAdaptedForOlderProtocolVersion()` - Tests protocol adaptation for backward compatibility
 
 **Why Critical**: Without proper version negotiation, servers cannot support clients running different SDK versions, breaking backward compatibility.
 
@@ -110,16 +115,19 @@ This test ensures servers can negotiate with clients using different protocol ve
 ### 3. BaseSessionTest.php
 
 **Location**: `tests/Shared/BaseSessionTest.php`
-**Source Code**: `src/Shared/BaseSession.php:109-155`
+**Source Code**: `src/Shared/BaseSession.php:109-320`
 
-**Purpose**: Validates JSON-RPC error propagation and response handler cleanup.
+**Purpose**: Validates JSON-RPC error propagation, response handler cleanup, and server-side message dispatch.
 
-Error handling is fundamental to robust communication. This test validates:
+Error handling and message dispatch are fundamental to robust communication. This test validates:
 
 - **Error conversion**: `JSONRPCError` responses properly raise `McpError` exceptions
 - **Error data preservation**: Error code, message, and data are correctly embedded
 - **Handler cleanup**: Response handlers are removed after both success and error (prevents memory leaks)
 - **No hanging**: Errors don't cause infinite wait loops
+- **Request dispatch**: Incoming requests are routed to registered handlers with correct parameters
+- **Notification handling**: Incoming notifications invoke handlers without sending responses
+- **JSON-RPC validation**: Messages with invalid JSON-RPC versions are rejected
 
 **Key Tests**:
 - `testSendRequestThrowsMcpErrorOnJsonRpcError()` - Validates error propagation flow
@@ -128,6 +136,9 @@ Error handling is fundamental to robust communication. This test validates:
 - `testDifferentErrorCodesArePropagated()` - Tests 6 different error codes (JSON-RPC standard + custom)
 - `testErrorWithNullDataIsHandled()` - Validates null error.data handling
 - `testMultipleRequestsCleanUpHandlers()` - Prevents memory leaks over multiple requests
+- `testIncomingRequestDispatchesThroughResponder()` - Tests server-side request routing and response correlation
+- `testIncomingNotificationInvokesRegisteredHandlers()` - Tests fire-and-forget notification handling
+- `testInvalidJsonRpcVersionRejectsMessage()` - Tests JSON-RPC 2.0 version validation
 
 **Why Critical**: If error propagation is broken, clients will hang waiting for responses that never arrive, or leak memory from uncleaned handlers.
 
@@ -199,7 +210,9 @@ public function testFeatureWorksCorrectly(): void
 ### Using Test Doubles
 - Use **MemoryStream** for client tests (bidirectional in-memory communication)
 - Use **InMemoryTransport** for server tests (implements Transport interface)
-- Use **FakeSession** for BaseSession tests (extends BaseSession with queue)
+- Use **FakeSession** for BaseSession tests (extends BaseSession with message queue)
+- Use **TestableServerSession** to expose BaseSession's protected methods for integration tests
+- Use **TimeoutMemoryStream** to simulate timeout scenarios in client initialization
 - Create minimal implementations of `McpModel` for test data
 
 ## Continuous Integration

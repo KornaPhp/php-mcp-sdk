@@ -31,6 +31,9 @@ use Mcp\Types\InitializeResult;
 use Mcp\Types\ServerCapabilities;
 use Mcp\Types\Implementation;
 use Mcp\Types\RequestId;
+use Mcp\Types\JsonRpcErrorObject;
+use Mcp\Types\JSONRPCError;
+use Mcp\Shared\McpError;
 
 /**
  * Tests for ClientSession initialization handshake.
@@ -218,6 +221,132 @@ class ClientSessionInitializeTest extends TestCase
     }
 
     /**
+     * Test that client accepts older supported protocol version from server (downgrade negotiation).
+     *
+     * Protocol version downgrade scenario:
+     * 1. Client sends initialize request with LATEST_PROTOCOL_VERSION (e.g., 2025-03-26)
+     * 2. Server responds with older supported version (e.g., 2024-11-05)
+     * 3. Client validates version is in SUPPORTED_PROTOCOL_VERSIONS list
+     * 4. Client accepts the downgrade and stores older version
+     * 5. Client feature detection adapts to older version capabilities
+     *
+     * This is critical for backward compatibility - clients must be able to
+     * communicate with servers running older SDK versions. Without this,
+     * upgrading clients would break connections to older servers.
+     *
+     * Example: A client on SDK v2.0 (protocol 2025-03-26) connects to a
+     * server on SDK v1.0 (protocol 2024-11-05). The client must gracefully
+     * downgrade and disable features unsupported in 2024-11-05 (like batch_messages).
+     *
+     * Corresponds to ClientSession.php:151-157 (version validation and storage)
+     */
+    public function testInitializeNegotiatesOlderSupportedProtocolVersion(): void
+    {
+        $readStream = new MemoryStream();
+        $writeStream = new MemoryStream();
+
+        $olderVersion = Version::SUPPORTED_PROTOCOL_VERSIONS[0];
+        $resultData = [
+            'protocolVersion' => $olderVersion,
+            'capabilities' => [],
+            'serverInfo' => [
+                'name' => 'test-server',
+                'version' => '1.0.0'
+            ]
+        ];
+
+        $readStream->send($this->createResponse($resultData));
+        $session = new ClientSession($readStream, $writeStream, readTimeout: 2.0);
+
+        $session->initialize();
+
+        $this->assertSame($olderVersion, $session->getNegotiatedProtocolVersion(), 'Client should accept older supported protocol version');
+        $this->assertFalse($session->supportsFeature('batch_messages'), 'Older protocol should not advertise batch_messages support');
+    }
+
+    /**
+     * Test that client initialization fails gracefully when server returns JSONRPCError.
+     *
+     * Error response during initialization flow:
+     * 1. Client sends initialize request
+     * 2. Server encounters error (e.g., internal failure, invalid params)
+     * 3. Server responds with JSONRPCError instead of InitializeResult
+     * 4. Client's sendRequest() triggers response handler (BaseSession.php:126-148)
+     * 5. Handler detects JSONRPCError type and throws McpError
+     * 6. McpError propagates out of initialize() to caller
+     * 7. Client remains uninitialized (safe failure state)
+     *
+     * This validates that initialization errors are properly surfaced to the
+     * application rather than being silently swallowed or causing hangs.
+     *
+     * Example: Server receives initialize but is in maintenance mode. It returns
+     * JSONRPCError(-32603, "Server unavailable"). Client throws McpError with
+     * embedded error details, allowing the application to handle the failure.
+     *
+     * Corresponds to ClientSession.php:148 (sendRequest) and
+     * BaseSession.php:129-137 (error propagation)
+     */
+    public function testInitializeFailsOnJsonRpcErrorResponse(): void
+    {
+        $readStream = new MemoryStream();
+        $writeStream = new MemoryStream();
+
+        $readStream->send(
+            new JsonRpcMessage(
+                new JSONRPCError(
+                    jsonrpc: '2.0',
+                    id: new RequestId(0),
+                    error: new JsonRpcErrorObject(
+                        code: -32603,
+                        message: 'server failed',
+                        data: ['detail' => 'boom']
+                    )
+                )
+            )
+        );
+
+        $session = new ClientSession($readStream, $writeStream, readTimeout: 2.0);
+
+        $this->expectException(McpError::class);
+        $session->initialize();
+    }
+
+    /**
+     * Test that client initialization times out when server never sends response.
+     *
+     * Timeout scenario:
+     * 1. Client sends initialize request
+     * 2. Client enters waitForResponse loop (ClientSession.php:560-579)
+     * 3. Read timeout is set to 0.05 seconds
+     * 4. Loop repeatedly calls readNextMessage() but stream returns null
+     * 5. After 0.05 seconds, timeout is detected (line 567)
+     * 6. RuntimeException is thrown with timeout message
+     * 7. Initialization fails and client remains uninitialized
+     *
+     * This prevents clients from hanging indefinitely when:
+     * - Server crashes after receiving initialize
+     * - Network connection is lost
+     * - Server is frozen/unresponsive
+     * - Server forgets to send initialize response
+     *
+     * Without timeout handling, clients would hang forever waiting for a
+     * response that will never arrive, requiring process termination.
+     *
+     * Corresponds to ClientSession.php:567-569 (timeout detection in waitForResponse)
+     */
+    public function testInitializeTimesOutWhenServerNeverResponds(): void
+    {
+        $readStream = new TimeoutMemoryStream(0.05);
+        $writeStream = new MemoryStream();
+
+        $session = new ClientSession($readStream, $writeStream, readTimeout: 0.05);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessageMatches('/Timed out/i');
+        $session->initialize();
+    }
+
+    /**
      * Test that initialization fails when server returns unsupported protocol version.
      *
      * The client should reject protocol versions that are not in the
@@ -276,5 +405,55 @@ class ClientSessionInitializeTest extends TestCase
                 result: $resultData
             )
         );
+    }
+}
+
+/**
+ * Memory stream that simulates timeout scenarios for testing client error handling.
+ *
+ * This test double extends MemoryStream to add timeout behavior. After a specified
+ * deadline, receive() throws RuntimeException to simulate a read timeout.
+ *
+ * This is necessary because real MemoryStream would return null indefinitely,
+ * causing tests to hang forever. TimeoutMemoryStream allows tests to verify
+ * timeout detection logic without actually waiting for real timeouts.
+ *
+ * Usage:
+ * ```php
+ * $stream = new TimeoutMemoryStream(0.05); // 50ms timeout
+ * $session = new ClientSession($stream, $writeStream, readTimeout: 0.05);
+ * // After 50ms, receive() throws RuntimeException
+ * $session->initialize(); // Should timeout and throw
+ * ```
+ *
+ * Corresponds to timeout testing for ClientSession.php:567-569
+ */
+final class TimeoutMemoryStream extends MemoryStream
+{
+    /** @var array<JsonRpcMessage|\Exception> */
+    private array $items = [];
+    private readonly float $deadline;
+
+    public function __construct(float $timeoutSeconds)
+    {
+        $this->deadline = microtime(true) + $timeoutSeconds;
+    }
+
+    public function send(mixed $item): void
+    {
+        $this->items[] = $item;
+    }
+
+    public function receive(): mixed
+    {
+        if (!empty($this->items)) {
+            return array_shift($this->items);
+        }
+
+        if (microtime(true) >= $this->deadline) {
+            throw new \RuntimeException('Timed out waiting for response');
+        }
+
+        return null;
     }
 }

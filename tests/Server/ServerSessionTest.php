@@ -32,9 +32,15 @@ use Mcp\Types\InitializeRequest;
 use Mcp\Types\InitializeRequestParams;
 use Mcp\Types\InitializeResult;
 use Mcp\Types\JsonRpcMessage;
+use Mcp\Types\JSONRPCRequest;
 use Mcp\Types\JSONRPCResponse;
 use Mcp\Types\RequestId;
 use Mcp\Types\ServerCapabilities;
+use Mcp\Types\CallToolResult;
+use Mcp\Types\TextContent;
+use Mcp\Types\AudioContent;
+use Mcp\Types\Annotations;
+use Mcp\Types\RequestParams;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -344,6 +350,134 @@ final class ServerSessionTest extends TestCase
     }
 
     /**
+     * Test that initialize requests are properly routed through BaseSession message handling.
+     *
+     * Integration test flow:
+     * 1. Create raw JSON-RPC initialize request message
+     * 2. Feed message through BaseSession::handleIncomingMessage() (not direct handleRequest)
+     * 3. Verify message is validated, routed, and processed correctly
+     * 4. Confirm initialization state transitions occur
+     * 5. Validate negotiated protocol version is stored
+     *
+     * This is critical because it tests the ACTUAL message intake path that production
+     * code uses, unlike unit tests that call handleRequest() directly and bypass
+     * BaseSession's JSON-RPC validation, parameter extraction, and routing logic.
+     *
+     * Without this test, bugs in BaseSession::handleIncomingMessage() (lines 250-320)
+     * could break initialization without being detected by other tests.
+     *
+     * Corresponds to BaseSession.php:250-320 (handleIncomingMessage) and
+     * ServerSession.php:231-254 (handleInitialize)
+     */
+    public function testIncomingInitializeMessageFlowsThroughBaseSession(): void
+    {
+        $transport = new InMemoryTransport();
+        $options = new InitializationOptions(
+            serverName: 'test-server',
+            serverVersion: '1.0.0',
+            capabilities: new ServerCapabilities()
+        );
+        $session = new TestableServerSession($transport, $options);
+
+        $initialize = new JsonRpcMessage(
+            new JSONRPCRequest(
+                jsonrpc: '2.0',
+                id: new RequestId(9),
+                method: 'initialize',
+                params: new RawInitializeParams(
+                    protocolVersion: Version::LATEST_PROTOCOL_VERSION,
+                    capabilities: ['roots' => null],
+                    clientInfo: ['name' => 'test-client', 'version' => '1.2.3']
+                )
+            )
+        );
+
+        $session->processIncoming($initialize);
+
+        $this->assertCount(1, $transport->writtenMessages, 'Initialize should produce a response via BaseSession routing');
+        $this->assertSame(
+            InitializationState::Initialized,
+            $this->readProperty($session, 'initializationState'),
+            'Initialization should advance state through BaseSession path'
+        );
+        $this->assertSame(
+            Version::LATEST_PROTOCOL_VERSION,
+            $this->readProperty($session, 'negotiatedProtocolVersion'),
+            'Negotiated version should be recorded after BaseSession dispatch'
+        );
+    }
+
+    /**
+     * Test that server adapts responses for clients using older protocol versions.
+     *
+     * Protocol adaptation flow:
+     * 1. Client negotiates to older protocol version (2024-11-05)
+     * 2. Server generates response with new features (AudioContent, Annotations)
+     * 3. Server's writeMessage() detects older protocol and adapts response
+     * 4. AudioContent is stripped (not supported in older version)
+     * 5. Annotations are removed from TextContent (not supported in older version)
+     * 6. Adapted response is sent to client
+     *
+     * This ensures backward compatibility - servers can talk to clients running
+     * older SDK versions without sending features the client can't understand.
+     *
+     * Example: A client on 2024-11-05 calls a tool that returns AudioContent.
+     * The server must remove AudioContent from the response since the client
+     * doesn't know how to handle it.
+     *
+     * Corresponds to ServerSession.php:442-539 (adaptResponseForClient methods)
+     * and ServerSession.php:587-607 (writeMessage adaptation logic)
+     */
+    public function testResponsesAdaptedForOlderProtocolVersion(): void
+    {
+        $transport = new InMemoryTransport();
+        $options = new InitializationOptions(
+            serverName: 'test-server',
+            serverVersion: '1.0.0',
+            capabilities: new ServerCapabilities()
+        );
+        $session = new TestableServerSession($transport, $options);
+
+        $initialize = new JsonRpcMessage(
+            new JSONRPCRequest(
+                jsonrpc: '2.0',
+                id: new RequestId(4),
+                method: 'initialize',
+                params: new RawInitializeParams(
+                    protocolVersion: Version::SUPPORTED_PROTOCOL_VERSIONS[0],
+                    capabilities: ['roots' => null],
+                    clientInfo: ['name' => 'legacy', 'version' => '0.1.0']
+                )
+            )
+        );
+
+        $session->processIncoming($initialize);
+
+        $callResult = new CallToolResult([
+            new AudioContent('abc', 'audio/wav'),
+            new TextContent('hello', new Annotations(priority: 0.5)),
+        ]);
+
+        $session->sendResponseForTest(
+            new JsonRpcMessage(
+                new JSONRPCResponse(
+                    jsonrpc: '2.0',
+                    id: new RequestId(10),
+                    result: $callResult
+                )
+            )
+        );
+
+        $this->assertCount(2, $transport->writtenMessages, 'Initialize and adapted response should be written');
+        $adapted = $transport->writtenMessages[1]->message->result;
+        $this->assertInstanceOf(CallToolResult::class, $adapted);
+        $this->assertCount(1, $adapted->content, 'Audio content should be stripped for older protocol');
+        $this->assertInstanceOf(TextContent::class, $adapted->content[0]);
+        $this->assertNull($adapted->content[0]->annotations, 'Annotations should be removed for older protocol');
+        $this->assertSame('hello', $adapted->content[0]->text, 'Existing text content should be preserved');
+    }
+
+    /**
      * Create a test ServerSession with standard initialization options.
      *
      * @param InMemoryTransport $transport The transport to use for the session
@@ -439,5 +573,81 @@ final class InMemoryTransport implements Transport
     public function writeMessage(JsonRpcMessage $message): void
     {
         $this->writtenMessages[] = $message;
+    }
+}
+
+/**
+ * Testable ServerSession that exposes BaseSession's protected methods for integration testing.
+ *
+ * This test double extends ServerSession to expose handleIncomingMessage() and writeMessage()
+ * as public methods, allowing tests to:
+ * - Feed raw JSON-RPC messages through the complete BaseSession routing path
+ * - Simulate server responses without going through actual transport layers
+ * - Test the full message flow: JSON-RPC → validation → dispatch → handler → response
+ *
+ * Unlike unit tests that call handleRequest() directly (bypassing BaseSession),
+ * this enables integration tests that exercise the actual production code path.
+ *
+ * Usage:
+ * ```php
+ * $session = new TestableServerSession($transport, $options);
+ * $session->processIncoming($jsonRpcMessage); // Routes through BaseSession
+ * ```
+ */
+final class TestableServerSession extends ServerSession
+{
+    public function processIncoming(JsonRpcMessage $message): void
+    {
+        $this->handleIncomingMessage($message);
+    }
+
+    public function sendResponseForTest(JsonRpcMessage $message): void
+    {
+        $this->writeMessage($message);
+    }
+}
+
+/**
+ * Raw initialize parameters that serialize to wire-format arrays instead of typed objects.
+ *
+ * This test helper differs from InitializeRequestParams by serializing to plain arrays
+ * rather than nested objects. This is necessary for integration tests that need to
+ * simulate actual JSON-RPC messages as they arrive over the wire.
+ *
+ * When JSON is decoded, params arrive as arrays (e.g., ['protocolVersion' => '2025-03-26']),
+ * not as typed InitializeRequestParams objects. This class replicates that wire format.
+ *
+ * Without this, integration tests would use typed params that skip BaseSession's
+ * parameter extraction and validation logic (lines 273-283).
+ *
+ * Usage:
+ * ```php
+ * $params = new RawInitializeParams(
+ *     protocolVersion: '2025-03-26',
+ *     capabilities: ['roots' => null],
+ *     clientInfo: ['name' => 'test', 'version' => '1.0']
+ * );
+ * // Serializes to: ['protocolVersion' => '2025-03-26', 'capabilities' => [...], ...]
+ * ```
+ */
+final class RawInitializeParams extends RequestParams
+{
+    public function __construct(
+        private readonly string $protocolVersion,
+        private readonly array $capabilities = [],
+        private readonly array $clientInfo
+    ) {
+        parent::__construct();
+    }
+
+    public function validate(): void {}
+
+    public function jsonSerialize(): mixed
+    {
+        return [
+            'protocolVersion' => $this->protocolVersion,
+            'capabilities' => $this->capabilities,
+            'clientInfo' => $this->clientInfo,
+        ];
     }
 }
