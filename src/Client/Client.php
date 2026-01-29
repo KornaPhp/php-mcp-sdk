@@ -29,6 +29,7 @@ declare(strict_types=1);
 
 namespace Mcp\Client;
 
+use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Transport\StdioServerParameters;
 use Mcp\Client\Transport\StdioTransport;
 use Mcp\Client\Transport\StreamableHttpTransport;
@@ -106,6 +107,12 @@ class Client {
                 $headers = $args ?? []; // For HTTP, args are used as headers
                 $httpOptions = $env ?? []; // For HTTP, env is used for HTTP options
                 
+                // Extract OAuth configuration if provided
+                $oauthConfig = null;
+                if (isset($httpOptions['oauth']) && $httpOptions['oauth'] instanceof OAuthConfiguration) {
+                    $oauthConfig = $httpOptions['oauth'];
+                }
+
                 // Create HTTP configuration
                 $httpConfig = new HttpConfiguration(
                     endpoint: $commandOrUrl,
@@ -118,7 +125,8 @@ class Client {
                     retryDelay: $httpOptions['retryDelay'] ?? 0.5,
                     verifyTls: $httpOptions['verifyTls'] ?? true,
                     caFile: $httpOptions['caFile'] ?? null,
-                    curlOptions: $httpOptions['curlOptions'] ?? []
+                    curlOptions: $httpOptions['curlOptions'] ?? [],
+                    oauthConfig: $oauthConfig
                 );
                 
                 // Create the HTTP transport

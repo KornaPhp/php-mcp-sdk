@@ -237,24 +237,19 @@ We are currently implementing the 2025-03-26 revision of the MCP Spec.
 - Create classes for new spec features
 - Add support for JSON-RPC batching
 - Implement HTTP transport
-
-### Available For Testing
 - Implement server side authorization framework based on OAuth 2.1
 
-### To Do
+### In Development
 - Implement client side authorization framework based on OAuth 2.1
-- Explore the feasibility of supporting SSE in PHP environments
 
 ## Credits
 
 This PHP SDK was developed by:
 - [Josh Abbott](https://joshabbott.com)
 - Claude 3.5 Sonnet
-- Claude Opus 4
+- Claude Opus 4.5
 
 Additional debugging and refactoring done by Josh Abbott using OpenAI ChatGPT o1 pro mode and OpenAI Codex.
-
-Based on the original [Python SDK](https://github.com/modelcontextprotocol/python-sdk) for the Model Context Protocol.
 
 ## License
 
