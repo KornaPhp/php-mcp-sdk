@@ -45,6 +45,11 @@ class LoopbackCallbackHandler implements AuthorizationCallbackInterface
     private bool $openBrowser;
 
     /**
+     * The actual port used after the server starts (for auto-port mode).
+     */
+    private ?int $lastUsedPort = null;
+
+    /**
      * @param int $port The port to listen on (default: auto-select)
      * @param int $timeout Timeout in seconds for waiting for callback
      * @param bool $openBrowser Whether to attempt to open the browser automatically
@@ -72,7 +77,13 @@ class LoopbackCallbackHandler implements AuthorizationCallbackInterface
         $socket = $this->createServer();
         $actualPort = $this->getSocketPort($socket);
 
+        // Store the actual port for later retrieval
+        $this->lastUsedPort = $actualPort;
+
         $this->logger->info("Started callback server on {$this->host}:{$actualPort}");
+
+        // Replace {PORT} placeholder with actual port if present
+        $authUrl = str_replace('{PORT}', (string) $actualPort, $authUrl);
 
         try {
             // Present authorization URL to user
@@ -92,11 +103,13 @@ class LoopbackCallbackHandler implements AuthorizationCallbackInterface
      */
     public function getRedirectUri(): string
     {
-        // If port is auto-selected, we need to use the actual port later
-        // For now, return a placeholder that will be updated
+        // If we have a last used port, use it
+        if ($this->lastUsedPort !== null) {
+            return "http://{$this->host}:{$this->lastUsedPort}/callback";
+        }
+
+        // If port is auto-selected and not yet determined, return placeholder
         if ($this->port === 0) {
-            // This is a special case - the actual port is determined at runtime
-            // The OAuthClient should call authorize() and construct the URL after
             return "http://{$this->host}:{PORT}/callback";
         }
 
@@ -104,14 +117,36 @@ class LoopbackCallbackHandler implements AuthorizationCallbackInterface
     }
 
     /**
-     * Get the redirect URI with actual port.
+     * Get the redirect URI with the actual port after authorization.
      *
-     * @param int $port The actual port number
-     * @return string The redirect URI with the port
+     * Call this after authorize() has been invoked to get the actual
+     * redirect URI that was used. This is needed for the token request.
+     *
+     * @return string The redirect URI with the actual port
+     * @throws OAuthException If called before authorize()
      */
-    public function getRedirectUriWithPort(int $port): string
+    public function getActualRedirectUri(): string
     {
-        return "http://{$this->host}:{$port}/callback";
+        if ($this->lastUsedPort === null) {
+            if ($this->port === 0) {
+                throw new OAuthException(
+                    'Cannot get actual redirect URI before authorize() is called'
+                );
+            }
+            return "http://{$this->host}:{$this->port}/callback";
+        }
+
+        return "http://{$this->host}:{$this->lastUsedPort}/callback";
+    }
+
+    /**
+     * Get the last used port (after authorize() was called).
+     *
+     * @return int|null The port number, or null if not yet determined
+     */
+    public function getLastUsedPort(): ?int
+    {
+        return $this->lastUsedPort;
     }
 
     /**

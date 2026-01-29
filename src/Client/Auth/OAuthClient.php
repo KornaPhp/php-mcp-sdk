@@ -428,9 +428,21 @@ class OAuthClient implements OAuthClientInterface
             $callback = $this->getAuthCallback();
             $redirectUri = $callback->getRedirectUri();
 
+            // For auto-port loopback handler, we need to register with actual redirect URIs.
+            // Per RFC 8252, authorization servers SHOULD allow any port on loopback interfaces.
+            // We register both localhost and 127.0.0.1 variants to maximize compatibility.
+            $redirectUris = [$redirectUri];
+            if ($callback instanceof LoopbackCallbackHandler && strpos($redirectUri, '{PORT}') !== false) {
+                // Register with common loopback URIs - AS should accept any port per RFC 8252
+                $redirectUris = [
+                    'http://127.0.0.1/callback',
+                    'http://localhost/callback',
+                ];
+            }
+
             $metadata = DynamicClientRegistration::buildMetadata(
                 clientName: 'MCP PHP Client',
-                redirectUris: [$redirectUri]
+                redirectUris: $redirectUris
             );
 
             $credentials = $this->dcr->register($asMetadata, $metadata);
@@ -488,13 +500,6 @@ class OAuthClient implements OAuthClientInterface
             $redirectUri = $callback->getRedirectUri();
         }
 
-        // For loopback handler with auto port, we need special handling
-        if ($callback instanceof LoopbackCallbackHandler && strpos($redirectUri, '{PORT}') !== false) {
-            // The callback will determine the port during authorize()
-            // We need to build the URL after creating the server
-            // This is handled by the callback itself
-        }
-
         // Build authorization URL
         $authParams = [
             'response_type' => 'code',
@@ -519,7 +524,15 @@ class OAuthClient implements OAuthClientInterface
         ]);
 
         // Execute authorization flow via callback handler
+        // Note: For LoopbackCallbackHandler with auto-port, the handler will replace
+        // the {PORT} placeholder in the auth URL with the actual port
         $code = $callback->authorize($authUrl, $state);
+
+        // Get the actual redirect URI used (important for auto-port loopback handler)
+        // After authorize() completes, the handler knows the actual port that was used
+        if ($callback instanceof LoopbackCallbackHandler) {
+            $redirectUri = $callback->getActualRedirectUri();
+        }
 
         // Exchange code for tokens
         $tokenParams = array_merge(
