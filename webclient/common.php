@@ -41,6 +41,8 @@ if (session_status() === PHP_SESSION_NONE) {
 // Require Composer autoloader
 require_once __DIR__ . '/vendor/autoload.php';
 require_once __DIR__ . '/lib/McpWebClient.php';
+require_once __DIR__ . '/lib/WebCallbackHandler.php';
+require_once __DIR__ . '/lib/SessionTokenStorage.php';
 
 // Import required classes
 use Monolog\Logger;
@@ -48,6 +50,7 @@ use Monolog\Handler\StreamHandler;
 use Monolog\Handler\RotatingFileHandler;
 use Monolog\Formatter\LineFormatter;
 use Monolog\Handler\BufferHandler;
+use Mcp\Client\Auth\Token\FileTokenStorage;
 
 /**
  * Initialize and configure logger
@@ -204,3 +207,80 @@ $mcpClient = new McpWebClient($logger);
 register_shutdown_function(function() {
     // Nothing to clean up - connections are closed after each operation
 });
+
+/**
+ * Get or generate the encryption secret for token storage.
+ *
+ * The secret is stored in a file for persistence across requests.
+ * If no secret file exists, a new one is generated.
+ *
+ * @return string The encryption secret
+ */
+function getEncryptionSecret(): string {
+    $secretFile = __DIR__ . '/.token_secret';
+
+    if (file_exists($secretFile)) {
+        $secret = file_get_contents($secretFile);
+        if ($secret !== false && strlen($secret) >= 32) {
+            return $secret;
+        }
+    }
+
+    // Generate a new secret
+    $secret = bin2hex(random_bytes(32));
+
+    // Store it with restricted permissions
+    file_put_contents($secretFile, $secret);
+    chmod($secretFile, 0600);
+
+    return $secret;
+}
+
+/**
+ * Get the OAuth callback URL for this webclient installation.
+ *
+ * Automatically detects the protocol, host, and path.
+ *
+ * @return string The full callback URL
+ */
+function getCallbackUrl(): string {
+    // Detect protocol
+    $protocol = 'http';
+    if (
+        (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+        (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ||
+        (!empty($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
+    ) {
+        $protocol = 'https';
+    }
+
+    // Detect host
+    $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
+
+    // Detect base path (directory containing common.php)
+    $scriptDir = dirname($_SERVER['SCRIPT_NAME']);
+    $basePath = rtrim($scriptDir, '/');
+
+    return "{$protocol}://{$host}{$basePath}/oauth_callback.php";
+}
+
+/**
+ * Get the token storage directory path.
+ *
+ * @return string The path to the tokens directory
+ */
+function getTokenStoragePath(): string {
+    return __DIR__ . '/tokens';
+}
+
+/**
+ * Create a session-based token storage instance.
+ *
+ * @return SessionTokenStorage
+ */
+function createTokenStorage(): SessionTokenStorage {
+    return new SessionTokenStorage(
+        getTokenStoragePath(),
+        getEncryptionSecret()
+    );
+}

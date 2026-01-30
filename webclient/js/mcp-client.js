@@ -9,12 +9,156 @@ class McpClientUI {
     constructor() {
         this.sessionId = null;
         this.capabilities = null;
+        this.serverType = 'stdio'; // 'stdio' or 'http'
+        this.connectionType = null; // Track actual connection type
         this.debugPanel = document.getElementById('debug-panel');
+        this.pendingOAuthServerId = null;
         this.addStyles();
         this.setupEventListeners();
         this.initializeDebugPanel();
+        this.initializeServerTypeToggle();
+        this.initializeOAuthToggle();
+
+        // Check for OAuth return on page load
+        this.checkOAuthReturn();
     }
-    
+
+    // Server Type Toggle
+    initializeServerTypeToggle() {
+        const stdioRadio = document.getElementById('serverTypeStdio');
+        const httpRadio = document.getElementById('serverTypeHttp');
+        const stdioFields = document.getElementById('stdio-fields');
+        const httpFields = document.getElementById('http-fields');
+
+        const updateFields = () => {
+            if (stdioRadio.checked) {
+                this.serverType = 'stdio';
+                stdioFields.classList.add('active');
+                httpFields.classList.remove('active');
+            } else {
+                this.serverType = 'http';
+                stdioFields.classList.remove('active');
+                httpFields.classList.add('active');
+            }
+        };
+
+        stdioRadio.addEventListener('change', updateFields);
+        httpRadio.addEventListener('change', updateFields);
+
+        // Set initial state
+        updateFields();
+    }
+
+    // OAuth Toggle
+    initializeOAuthToggle() {
+        const oauthEnabled = document.getElementById('oauth-enabled');
+        const oauthFields = document.getElementById('oauth-fields');
+
+        oauthEnabled.addEventListener('change', () => {
+            oauthFields.style.display = oauthEnabled.checked ? 'block' : 'none';
+        });
+    }
+
+    // Check for OAuth return from authorization server
+    checkOAuthReturn() {
+        const oauthState = window.mcpOAuthState;
+
+        if (oauthState.error) {
+            this.showError(`OAuth authorization failed: ${oauthState.error}`);
+            // Clean up URL
+            window.history.replaceState({}, document.title, window.location.pathname);
+            return;
+        }
+
+        if (oauthState.success && oauthState.serverId) {
+            this.showNotification('OAuth authorization successful. Completing connection...', 'info');
+            // Clean up URL
+            window.history.replaceState({}, document.title, window.location.pathname);
+            // Complete the OAuth connection
+            this.completeOAuthConnection(oauthState.serverId);
+        }
+    }
+
+    // Complete OAuth connection after callback
+    async completeOAuthConnection(serverId) {
+        try {
+            this.showLoading(true);
+            this.showOAuthStatus('Completing connection after authorization...');
+
+            const response = await fetch('connect.php', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    action: 'complete_oauth',
+                    serverId: serverId
+                })
+            });
+
+            const data = await response.json();
+
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
+            this.sessionId = data.data.sessionId;
+            this.capabilities = data.data.capabilities;
+            this.connectionType = data.data.type || 'http';
+
+            // Update UI
+            this.updateCapabilityPanels();
+            this.updateConnectionBadge();
+
+            // Update button states
+            document.getElementById('connect-btn').disabled = true;
+            document.getElementById('disconnect-btn').disabled = false;
+
+            // Update debug panel
+            this.appendDebugLog(data.logs);
+
+            this.showSuccess('Connected successfully via OAuth');
+            this.hideOAuthStatus();
+
+        } catch (error) {
+            this.showError(error.message);
+            this.hideOAuthStatus();
+        } finally {
+            this.showLoading(false);
+        }
+    }
+
+    // Show OAuth status
+    showOAuthStatus(message) {
+        const statusDiv = document.getElementById('oauth-status');
+        const statusText = document.getElementById('oauth-status-text');
+        statusText.textContent = message;
+        statusDiv.classList.add('active');
+    }
+
+    // Hide OAuth status
+    hideOAuthStatus() {
+        const statusDiv = document.getElementById('oauth-status');
+        statusDiv.classList.remove('active');
+    }
+
+    // Update connection badge in navbar
+    updateConnectionBadge() {
+        const badge = document.getElementById('connection-badge');
+        if (this.sessionId) {
+            badge.style.display = 'inline-block';
+            if (this.connectionType === 'http') {
+                badge.textContent = 'Remote (HTTP)';
+                badge.className = 'badge bg-info connection-badge';
+            } else {
+                badge.textContent = 'Local (stdio)';
+                badge.className = 'badge bg-success connection-badge';
+            }
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+
     // Notification Handling
     showNotification(message, type = 'info') {
         const id = 'notification-' + Date.now();
@@ -29,18 +173,18 @@ class McpClientUI {
                 </div>
             </div>
         `;
-        
+
         const notificationArea = document.getElementById('notification-area');
         notificationArea.insertAdjacentHTML('beforeend', html);
-        
+
         const toastElement = document.getElementById(id);
         const toast = new bootstrap.Toast(toastElement, {
             delay: 5000,
             autohide: true
         });
-        
+
         toast.show();
-        
+
         // Remove element after it's hidden
         toastElement.addEventListener('hidden.bs.toast', () => {
             toastElement.remove();
@@ -56,7 +200,7 @@ class McpClientUI {
     showSuccess(message) {
         this.showNotification(message, 'success');
     }
-    
+
     // Core Features
     setupEventListeners() {
         // Connection form handling
@@ -87,55 +231,106 @@ class McpClientUI {
     async connect() {
         try {
             this.showLoading(true);
-        
-            const command = document.getElementById('command').value;
-            const args = document.getElementById('args').value
-                .split('\n')
-                .filter(arg => arg.trim() !== '');
-                
-            // Parse environment variables
-            const envText = document.getElementById('env').value;
-            const env = {};
-            envText.split('\n')
-                .filter(line => line.trim() !== '')
-                .forEach(line => {
-                    const [key, ...valueParts] = line.split('=');
-                    if (key && valueParts.length > 0) {
-                        env[key.trim()] = valueParts.join('=').trim();
-                    }
-                });
-    
+
+            let requestBody;
+
+            if (this.serverType === 'http') {
+                // HTTP connection
+                const url = document.getElementById('http-url').value;
+                if (!url) {
+                    throw new Error('Server URL is required');
+                }
+
+                requestBody = {
+                    type: 'http',
+                    url: url,
+                    connectionTimeout: parseInt(document.getElementById('connection-timeout').value) || 30,
+                    readTimeout: parseInt(document.getElementById('read-timeout').value) || 60,
+                    verifyTls: document.getElementById('verify-tls').checked,
+                    headers: document.getElementById('custom-headers').value,
+                };
+
+                // Add OAuth config if enabled
+                const oauthEnabled = document.getElementById('oauth-enabled').checked;
+                if (oauthEnabled) {
+                    requestBody.oauthEnabled = true;
+                    requestBody.oauthClientId = document.getElementById('oauth-client-id').value || null;
+                    requestBody.oauthClientSecret = document.getElementById('oauth-client-secret').value || null;
+                }
+
+            } else {
+                // Stdio connection
+                const command = document.getElementById('command').value;
+                if (!command) {
+                    throw new Error('Command is required');
+                }
+
+                const args = document.getElementById('args').value
+                    .split('\n')
+                    .filter(arg => arg.trim() !== '');
+
+                // Parse environment variables
+                const envText = document.getElementById('env').value;
+                const env = {};
+                envText.split('\n')
+                    .filter(line => line.trim() !== '')
+                    .forEach(line => {
+                        const [key, ...valueParts] = line.split('=');
+                        if (key && valueParts.length > 0) {
+                            env[key.trim()] = valueParts.join('=').trim();
+                        }
+                    });
+
+                requestBody = {
+                    type: 'stdio',
+                    command,
+                    args,
+                    env: Object.keys(env).length > 0 ? env : undefined
+                };
+            }
+
             const response = await fetch('connect.php', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ 
-                    command, 
-                    args,
-                    env: Object.keys(env).length > 0 ? env : undefined
-                })
+                body: JSON.stringify(requestBody)
             });
 
             const data = await response.json();
-            
+
             if (data.error) {
                 throw new Error(data.error);
             }
 
+            // Check if OAuth redirect is required
+            if (data.data.requiresOAuth) {
+                this.pendingOAuthServerId = data.data.serverId;
+                this.showOAuthStatus('Redirecting to authorization server...');
+                this.appendDebugLog(data.logs);
+
+                // Redirect to authorization URL
+                window.location.href = data.data.authUrl;
+                return;
+            }
+
             this.sessionId = data.data.sessionId;
             this.capabilities = data.data.capabilities;
-            
+            this.connectionType = data.data.type || this.serverType;
+
             // Update UI based on capabilities
             this.updateCapabilityPanels();
-            
+            this.updateConnectionBadge();
+
             // Update button states
             document.getElementById('connect-btn').disabled = true;
             document.getElementById('disconnect-btn').disabled = false;
-            
+
             // Update debug panel
             this.appendDebugLog(data.logs);
-            
+
+            this.showSuccess(`Connected successfully (${this.connectionType})`);
+
         } catch (error) {
             this.showError(error.message);
         } finally {
@@ -158,6 +353,7 @@ class McpClientUI {
             // Reset UI
             this.sessionId = null;
             this.capabilities = null;
+            this.connectionType = null;
 
             this.promptsList = [];
             this.toolsList = [];
@@ -170,13 +366,16 @@ class McpClientUI {
             document.getElementById('prompt-details').classList.add('d-none');
             document.getElementById('tool-details').classList.add('d-none');
             document.getElementById('resource-details').classList.add('d-none');
-            
+
             this.updateCapabilityPanels();
-            
+            this.updateConnectionBadge();
+
             // Update button states
             document.getElementById('connect-btn').disabled = false;
             document.getElementById('disconnect-btn').disabled = true;
-            
+
+            this.showSuccess('Disconnected successfully');
+
         } catch (error) {
             this.showError(error.message);
         }
@@ -199,17 +398,17 @@ class McpClientUI {
             });
 
             const data = await response.json();
-            
+
             if (data.error) {
                 throw new Error(data.error);
             }
 
             // Update result panel
             this.updateResultPanel(operation, data.data);
-            
+
             // Update debug panel
             this.appendDebugLog(data.logs);
-            
+
         } catch (error) {
             this.showError(error.message);
         }
@@ -231,10 +430,10 @@ class McpClientUI {
     updateResultPanel(operation, result) {
         const panelId = `${operation.split('_')[1]}-result`;
         const panel = document.getElementById(panelId);
-        
+
         // Clear previous results
         panel.innerHTML = '';
-        
+
         // Create result display based on operation type
         switch (operation) {
             case 'list_prompts':
@@ -248,7 +447,7 @@ class McpClientUI {
                 break;
         }
     }
-    
+
     // Debug Console
     async fetchLogs(since = null) {
         try {
@@ -367,7 +566,7 @@ class McpClientUI {
         const prompt = this.findPrompt(promptName);
         const form = document.getElementById('prompt-form');
         const submitButton = form.querySelector('button[type="submit"]');
-    
+
         if (!prompt) {
             submitButton.disabled = true;
             return;
@@ -1328,8 +1527,8 @@ class McpClientUI {
                 <ul class="list-unstyled">
                     ${args.map(arg => `
                         <li>
-                            ${arg.name} 
-                            ${arg.required ? '(required)' : '(optional)'}: 
+                            ${arg.name}
+                            ${arg.required ? '(required)' : '(optional)'}:
                             ${arg.description || 'No description'}
                         </li>
                     `).join('')}

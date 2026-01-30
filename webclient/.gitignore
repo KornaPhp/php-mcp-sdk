@@ -1,0 +1,15 @@
+# Webclient specific ignores
+
+# Token storage directory contents (contains sensitive OAuth tokens)
+# But keep the .htaccess for security
+tokens/*
+!tokens/.htaccess
+
+# Auto-generated encryption secret (regenerated on first use)
+.token_secret
+
+# Logs (directory created automatically by initLogger())
+logs/
+
+# Composer dependencies (run 'composer install' in webclient directory)
+vendor/

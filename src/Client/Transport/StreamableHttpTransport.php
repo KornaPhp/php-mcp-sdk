@@ -348,6 +348,38 @@ class StreamableHttpTransport
             }
         }
 
+        // Check for HTTP error status codes that weren't handled by OAuth
+        // This prevents hanging when server returns error responses
+        if ($statusCode === 401) {
+            // 401 without OAuth configured - fail fast with clear message
+            $this->logger->error('Server returned 401 Unauthorized but OAuth is not configured');
+            throw new RuntimeException(
+                'Server requires authentication (HTTP 401). Configure OAuth or provide valid credentials.',
+                401
+            );
+        }
+
+        if ($statusCode === 403) {
+            // 403 that wasn't handled by OAuth insufficient_scope
+            $this->logger->error('Server returned 403 Forbidden');
+            throw new RuntimeException(
+                'Access forbidden (HTTP 403). Your credentials may be invalid or you lack permission.',
+                403
+            );
+        }
+
+        if ($statusCode >= 400) {
+            // Other 4xx/5xx errors - fail fast with status code
+            $this->logger->error("Server returned HTTP {$statusCode}", [
+                'statusCode' => $statusCode,
+                'body' => substr($responseBody, 0, 500) // Log first 500 chars for debugging
+            ]);
+            throw new RuntimeException(
+                "HTTP request failed with status {$statusCode}",
+                $statusCode
+            );
+        }
+
         // Check if we should process the response differently based on content-type
         $contentType = $responseHeaders['content-type'] ?? '';
 
