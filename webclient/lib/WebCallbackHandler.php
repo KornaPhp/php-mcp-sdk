@@ -26,7 +26,7 @@
 declare(strict_types=1);
 
 use Mcp\Client\Auth\Callback\AuthorizationCallbackInterface;
-use Mcp\Client\Auth\OAuthException;
+use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 
 /**
  * Web-based OAuth callback handler for the webclient.
@@ -34,9 +34,9 @@ use Mcp\Client\Auth\OAuthException;
  * Unlike LoopbackCallbackHandler which creates a local HTTP server,
  * this handler works with browser redirects in a web hosting environment.
  *
- * The authorize() method throws an exception with the authorization URL
- * because the actual authorization happens via browser redirect to the
- * OAuth provider, and the callback is received by oauth_callback.php.
+ * The authorize() method throws an AuthorizationRedirectException with all
+ * the information needed for the web application to redirect the user to
+ * the authorization server.
  */
 class WebCallbackHandler implements AuthorizationCallbackInterface
 {
@@ -55,26 +55,20 @@ class WebCallbackHandler implements AuthorizationCallbackInterface
      *
      * In web context, this method cannot complete synchronously because
      * authorization requires a browser redirect. Instead, it throws an
-     * OAuthException with the authorization URL for the webclient to
-     * redirect the user.
+     * AuthorizationRedirectException with the authorization URL and state
+     * for the webclient to redirect the user.
      *
-     * @throws OAuthException Always throws with authorization URL
+     * @throws AuthorizationRedirectException Always throws with authorization URL
      */
     public function authorize(string $authUrl, string $state): string
     {
         // In web hosting context, we can't wait synchronously for the callback.
         // The webclient must redirect the browser to the authorization URL
         // and handle the callback in oauth_callback.php.
-        throw new OAuthException(
-            'Web authorization requires browser redirect',
-            0,
-            null,
-            [
-                'auth_url' => $authUrl,
-                'state' => $state,
-                'redirect_uri' => $this->callbackUrl,
-                'requires_redirect' => true,
-            ]
+        throw new AuthorizationRedirectException(
+            $authUrl,
+            $state,
+            $this->callbackUrl
         );
     }
 

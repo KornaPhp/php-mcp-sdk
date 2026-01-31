@@ -34,11 +34,21 @@ use Psr\Log\NullLogger;
  *
  * Implements RFC9728 for Protected Resource Metadata and
  * RFC8414/OpenID Connect for Authorization Server Metadata.
+ *
+ * Includes security validations per RFC 8414:
+ * - Issuer validation: returned issuer must match requested issuer URL
+ * - Resource validation: returned resource must match or be a prefix of requested URL
+ * - Secure redirect handling: blocks cross-host and HTTPS-to-HTTP redirects
  */
 class MetadataDiscovery
 {
     private LoggerInterface $logger;
     private float $timeout;
+
+    /**
+     * Maximum number of redirects to follow.
+     */
+    private const MAX_REDIRECTS = 5;
 
     /**
      * @param float $timeout HTTP request timeout in seconds
@@ -76,6 +86,11 @@ class MetadataDiscovery
                 $data = $this->fetchJson($url);
 
                 if ($this->isValidResourceMetadata($data)) {
+                    // Validate resource identifier matches per RFC 9728
+                    if (!$this->validateResource($data['resource'], $resourceUrl)) {
+                        $this->logger->warning("Resource mismatch: metadata resource {$data['resource']} does not match requested URL {$resourceUrl}");
+                        throw OAuthException::discoveryFailed($resourceUrl, 'Resource mismatch in metadata');
+                    }
                     $this->logger->info("Found protected resource metadata at: {$url}");
                     return ProtectedResourceMetadata::fromArray($data);
                 }
@@ -112,6 +127,12 @@ class MetadataDiscovery
                 $data = $this->fetchJson($url);
 
                 if ($this->isValidAuthServerMetadata($data)) {
+                    // Validate issuer matches per RFC 8414 Section 3
+                    if (!$this->validateIssuer($data['issuer'], $issuerUrl)) {
+                        $this->logger->warning("Issuer mismatch: expected {$issuerUrl}, got {$data['issuer']}");
+                        throw OAuthException::discoveryFailed($issuerUrl, 'Issuer mismatch in metadata');
+                    }
+
                     $metadata = AuthorizationServerMetadata::fromArray($data);
 
                     // MCP MUST verify PKCE support
@@ -219,7 +240,11 @@ class MetadataDiscovery
     }
 
     /**
-     * Fetch JSON from a URL.
+     * Fetch JSON from a URL with secure redirect handling.
+     *
+     * Implements manual redirect following to prevent security issues:
+     * - Blocks cross-host redirects
+     * - Blocks HTTPS-to-HTTP downgrades
      *
      * @param string $url The URL to fetch
      * @return array The decoded JSON
@@ -227,41 +252,191 @@ class MetadataDiscovery
      */
     private function fetchJson(string $url): array
     {
-        $ch = curl_init($url);
-        if ($ch === false) {
-            throw new \RuntimeException('Failed to initialize cURL');
+        $currentUrl = $url;
+        $redirectCount = 0;
+        $originalParsed = parse_url($url);
+        $originalHost = $originalParsed['host'] ?? '';
+        $originalScheme = $originalParsed['scheme'] ?? 'https';
+
+        while ($redirectCount < self::MAX_REDIRECTS) {
+            $ch = curl_init($currentUrl);
+            if ($ch === false) {
+                throw new \RuntimeException('Failed to initialize cURL');
+            }
+
+            // Disable automatic redirect following for security
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_TIMEOUT => (int) $this->timeout,
+                CURLOPT_HTTPHEADER => [
+                    'Accept: application/json',
+                ],
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_HEADER => true,
+            ]);
+
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $error = curl_error($ch);
+            curl_close($ch);
+
+            if ($response === false) {
+                throw new \RuntimeException("HTTP request failed: {$error}");
+            }
+
+            // Check for redirect
+            if ($httpCode >= 300 && $httpCode < 400) {
+                $headers = substr($response, 0, $headerSize);
+                $location = $this->extractLocationHeader($headers);
+
+                if ($location === null) {
+                    throw new \RuntimeException("Redirect without Location header");
+                }
+
+                // Validate redirect security
+                $this->validateRedirect($currentUrl, $location, $originalHost, $originalScheme);
+
+                $currentUrl = $location;
+                $redirectCount++;
+                continue;
+            }
+
+            // Extract body
+            $body = substr($response, $headerSize);
+
+            if ($httpCode !== 200) {
+                throw new \RuntimeException("HTTP {$httpCode} response");
+            }
+
+            $data = json_decode($body, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new \RuntimeException('Invalid JSON response: ' . json_last_error_msg());
+            }
+
+            return $data;
         }
 
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => (int) $this->timeout,
-            CURLOPT_HTTPHEADER => [
-                'Accept: application/json',
-            ],
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-        ]);
+        throw new \RuntimeException('Too many redirects');
+    }
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
+    /**
+     * Extract Location header from response headers.
+     *
+     * @param string $headers Raw headers string
+     * @return string|null The Location header value or null
+     */
+    private function extractLocationHeader(string $headers): ?string
+    {
+        if (preg_match('/^Location:\s*(.+)$/mi', $headers, $matches)) {
+            return trim($matches[1]);
+        }
+        return null;
+    }
 
-        if ($response === false) {
-            throw new \RuntimeException("HTTP request failed: {$error}");
+    /**
+     * Validate that a redirect is secure.
+     *
+     * @param string $fromUrl The URL being redirected from
+     * @param string $toUrl The URL being redirected to
+     * @param string $originalHost The original request host
+     * @param string $originalScheme The original request scheme
+     * @throws \RuntimeException If redirect is not secure
+     */
+    private function validateRedirect(
+        string $fromUrl,
+        string $toUrl,
+        string $originalHost,
+        string $originalScheme
+    ): void {
+        $toParsed = parse_url($toUrl);
+        $toHost = $toParsed['host'] ?? '';
+        $toScheme = $toParsed['scheme'] ?? '';
+
+        // Block cross-host redirects
+        if ($toHost !== '' && strtolower($toHost) !== strtolower($originalHost)) {
+            $this->logger->warning("Blocked cross-host redirect from {$fromUrl} to {$toUrl}");
+            throw new \RuntimeException("Cross-host redirect not allowed for OAuth metadata discovery");
         }
 
-        if ($httpCode !== 200) {
-            throw new \RuntimeException("HTTP {$httpCode} response");
+        // Block HTTPS-to-HTTP downgrades
+        if ($originalScheme === 'https' && $toScheme === 'http') {
+            $this->logger->warning("Blocked HTTPS-to-HTTP downgrade redirect from {$fromUrl} to {$toUrl}");
+            throw new \RuntimeException("HTTPS-to-HTTP downgrade not allowed for OAuth metadata discovery");
+        }
+    }
+
+    /**
+     * Validate that the returned issuer matches the requested issuer per RFC 8414.
+     *
+     * @param string $returnedIssuer The issuer returned in metadata
+     * @param string $requestedIssuer The issuer URL that was requested
+     * @return bool True if valid
+     */
+    private function validateIssuer(string $returnedIssuer, string $requestedIssuer): bool
+    {
+        return $this->normalizeUrl($returnedIssuer) === $this->normalizeUrl($requestedIssuer);
+    }
+
+    /**
+     * Validate that the returned resource matches or is a prefix of the requested URL.
+     *
+     * @param string $returnedResource The resource returned in metadata
+     * @param string $requestedUrl The URL that was requested
+     * @return bool True if valid
+     */
+    private function validateResource(string $returnedResource, string $requestedUrl): bool
+    {
+        $returned = $this->normalizeUrl($returnedResource);
+        $requested = $this->normalizeUrl($requestedUrl);
+
+        // Resource should be equal to or a prefix of the requested URL
+        if ($requested === $returned) {
+            return true;
         }
 
-        $data = json_decode($response, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new \RuntimeException('Invalid JSON response: ' . json_last_error_msg());
+        // Check if requested URL starts with the resource (with proper path boundary)
+        $returnedWithSlash = rtrim($returned, '/') . '/';
+        return str_starts_with($requested, $returnedWithSlash);
+    }
+
+    /**
+     * Normalize a URL for comparison.
+     *
+     * - Lowercases scheme and host
+     * - Removes default ports (80 for HTTP, 443 for HTTPS)
+     * - Removes trailing slash from path
+     *
+     * @param string $url The URL to normalize
+     * @return string The normalized URL
+     */
+    private function normalizeUrl(string $url): string
+    {
+        $parsed = parse_url($url);
+        if ($parsed === false) {
+            return $url;
         }
 
-        return $data;
+        $scheme = strtolower($parsed['scheme'] ?? 'https');
+        $host = strtolower($parsed['host'] ?? '');
+        $port = $parsed['port'] ?? null;
+        $path = $parsed['path'] ?? '/';
+
+        // Remove default ports
+        if (($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80)) {
+            $port = null;
+        }
+
+        // Build normalized URL
+        $normalized = "{$scheme}://{$host}";
+        if ($port !== null) {
+            $normalized .= ":{$port}";
+        }
+        $normalized .= rtrim($path, '/');
+
+        return $normalized;
     }
 
     /**

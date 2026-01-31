@@ -31,6 +31,7 @@ use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthClientInterface;
 use Mcp\Client\Auth\OAuthException;
 use Mcp\Client\Auth\Token\TokenSet;
+use Mcp\Client\Transport\HttpAuthenticationException;
 use Mcp\Shared\MemoryStream;
 use Mcp\Types\JsonRpcMessage;
 use Mcp\Types\JSONRPCResponse;
@@ -351,11 +352,13 @@ class StreamableHttpTransport
         // Check for HTTP error status codes that weren't handled by OAuth
         // This prevents hanging when server returns error responses
         if ($statusCode === 401) {
-            // 401 without OAuth configured - fail fast with clear message
+            // 401 without OAuth configured - throw HttpAuthenticationException with parsed header
             $this->logger->error('Server returned 401 Unauthorized but OAuth is not configured');
-            throw new RuntimeException(
-                'Server requires authentication (HTTP 401). Configure OAuth or provide valid credentials.',
-                401
+            $wwwAuth = $this->parseWwwAuthenticate($responseHeaders['www-authenticate'] ?? '');
+            throw new HttpAuthenticationException(
+                401,
+                $wwwAuth,
+                'Server requires authentication (HTTP 401). Configure OAuth or provide valid credentials.'
             );
         }
 

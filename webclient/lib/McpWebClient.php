@@ -38,14 +38,11 @@ declare(strict_types=1);
 
 use Monolog\Logger;
 use Mcp\Client\Client;
-use Mcp\Client\Transport\StdioServerParameters;
+use Mcp\Client\Transport\HttpAuthenticationException;
 use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthException;
-use Mcp\Client\Auth\Discovery\MetadataDiscovery;
-use Mcp\Client\Auth\Pkce\PkceGenerator;
 use Mcp\Client\Auth\Registration\ClientCredentials;
-use Mcp\Types\InitializeResult;
 
 class McpWebClient {
     /** @var Client */
@@ -184,8 +181,27 @@ class McpWebClient {
                 'type' => 'http'
             ];
 
+        } catch (HttpAuthenticationException $e) {
+            // Handle 401 with parsed WWW-Authenticate header
+            $this->logger->info('Server requires authentication (401)', ['url' => $url]);
+
+            // If OAuth is enabled, initiate the OAuth flow with WWW-Authenticate data
+            if ($oauthConfig !== null && !empty($oauthConfig['enabled'])) {
+                return $this->initiateOAuthFlow(
+                    $url,
+                    $sessionId,
+                    $httpConfig,
+                    $oauthConfig,
+                    $e->getWwwAuthenticate()
+                );
+            }
+
+            // 401 without OAuth - rethrow with context
+            $this->logger->error("HTTP connection failed: " . $e->getMessage());
+            throw new RuntimeException("Failed to connect to HTTP MCP server: " . $e->getMessage(), $e->getCode(), $e);
+
         } catch (RuntimeException $e) {
-            // Check if this is a 401 error that we should handle with OAuth
+            // Check if this is a 401 error that we should handle with OAuth (fallback for edge cases)
             $code = $e->getCode();
             $message = $e->getMessage();
 
@@ -308,118 +324,81 @@ class McpWebClient {
     }
 
     /**
-     * Initiate OAuth flow for an HTTP server
+     * Initiate OAuth flow for an HTTP server using the SDK.
+     *
+     * @param string $url The server URL
+     * @param string $serverId The server identifier
+     * @param array $httpConfig HTTP configuration
+     * @param array $oauthConfig OAuth configuration
+     * @param array $wwwAuth Parsed WWW-Authenticate header (optional)
+     * @return array OAuth redirect information
      */
-    private function initiateOAuthFlow(string $url, string $serverId, array $httpConfig, array $oauthConfig): array {
-        $this->logger->info('Initiating OAuth flow', ['url' => $url]);
+    private function initiateOAuthFlow(
+        string $url,
+        string $serverId,
+        array $httpConfig,
+        array $oauthConfig,
+        array $wwwAuth = []
+    ): array {
+        $this->logger->info('Initiating OAuth flow using SDK', ['url' => $url]);
 
-        // Discover metadata
-        $discovery = new MetadataDiscovery(30.0, $this->logger);
-
-        // First try to discover resource metadata
         try {
-            $resourceMetadata = $discovery->discoverResourceMetadata($url);
-            $authServerUrl = $resourceMetadata->getPrimaryAuthorizationServer();
+            // Build OAuthConfiguration for the SDK
+            $tokenStorage = createTokenStorage();
 
-            if ($authServerUrl === null) {
-                throw new RuntimeException('No authorization server found in resource metadata');
-            }
-
-            $authServerMetadata = $discovery->discoverAuthorizationServerMetadata($authServerUrl);
-
-        } catch (\Exception $e) {
-            $this->logger->error('Metadata discovery failed: ' . $e->getMessage());
-            throw new RuntimeException('Failed to discover OAuth metadata: ' . $e->getMessage(), 0, $e);
-        }
-
-        // Generate PKCE
-        $pkce = new PkceGenerator();
-        $pkceData = $pkce->generate();
-
-        // Generate state for CSRF protection
-        $state = bin2hex(random_bytes(16));
-
-        // Get redirect URI
-        $redirectUri = getCallbackUrl();
-
-        // Determine client ID
-        $clientId = $oauthConfig['clientId'] ?? null;
-        $clientSecret = $oauthConfig['clientSecret'] ?? null;
-
-        // If no client ID, try dynamic client registration
-        if (empty($clientId) && $authServerMetadata->supportsDynamicRegistration()) {
-            $this->logger->info('Attempting dynamic client registration');
-
-            try {
-                $dcr = new \Mcp\Client\Auth\Registration\DynamicClientRegistration(30.0, $this->logger);
-                $metadata = \Mcp\Client\Auth\Registration\DynamicClientRegistration::buildMetadata(
-                    'MCP Web Client',
-                    [$redirectUri]
+            // Use pre-registered credentials if provided
+            $clientCredentials = null;
+            if (!empty($oauthConfig['clientId'])) {
+                $clientCredentials = new ClientCredentials(
+                    clientId: $oauthConfig['clientId'],
+                    clientSecret: $oauthConfig['clientSecret'] ?? null,
+                    tokenEndpointAuthMethod: $oauthConfig['tokenEndpointAuthMethod']
+                        ?? ClientCredentials::AUTH_METHOD_CLIENT_SECRET_POST
                 );
-                $credentials = $dcr->register($authServerMetadata, $metadata);
-                $clientId = $credentials->clientId;
-                $clientSecret = $credentials->clientSecret;
-            } catch (\Exception $e) {
-                $this->logger->warning('Dynamic client registration failed: ' . $e->getMessage());
-                throw new RuntimeException('No client ID provided and dynamic registration failed', 0, $e);
             }
+
+            $oauthConfigObj = new OAuthConfiguration(
+                clientCredentials: $clientCredentials,
+                tokenStorage: $tokenStorage,
+                authCallback: new WebCallbackHandler(getCallbackUrl()),
+                enableDynamicRegistration: true,
+                redirectUri: getCallbackUrl()
+            );
+
+            $oauthClient = new OAuthClient($oauthConfigObj, $this->logger);
+
+            // Use SDK to initiate authorization - this returns AuthorizationRequest
+            $authRequest = $oauthClient->initiateWebAuthorization($url, $wwwAuth);
+
+            // Store AuthorizationRequest in session for oauth_callback.php
+            $_SESSION['oauth_pending'][$serverId] = [
+                'authRequest' => $authRequest->toArray(),
+                'httpConfig' => $httpConfig,
+                'oauthConfig' => $oauthConfig,
+                'verifyTls' => $httpConfig['verifyTls'] ?? true,
+                'startedAt' => time(),
+            ];
+
+            $this->logger->info('OAuth flow initiated via SDK', [
+                'serverId' => $serverId,
+                'authUrl' => $authRequest->authorizationUrl,
+            ]);
+
+            // Return information for redirect
+            return [
+                'requiresOAuth' => true,
+                'authUrl' => $authRequest->authorizationUrl,
+                'serverId' => $serverId,
+                'message' => 'OAuth authorization required. Please authorize in the browser.',
+            ];
+
+        } catch (OAuthException $e) {
+            $this->logger->error('OAuth initialization failed: ' . $e->getMessage());
+            throw new RuntimeException('Failed to initiate OAuth: ' . $e->getMessage(), 0, $e);
+        } catch (\Exception $e) {
+            $this->logger->error('OAuth flow failed: ' . $e->getMessage());
+            throw new RuntimeException('Failed to initiate OAuth flow: ' . $e->getMessage(), 0, $e);
         }
-
-        if (empty($clientId)) {
-            throw new RuntimeException('Client ID is required for OAuth authorization');
-        }
-
-        // Determine scopes
-        $scopes = [];
-        if (isset($resourceMetadata->scopesSupported)) {
-            $scopes = $resourceMetadata->scopesSupported;
-        }
-
-        // Build authorization URL
-        $authParams = [
-            'response_type' => 'code',
-            'client_id' => $clientId,
-            'redirect_uri' => $redirectUri,
-            'state' => $state,
-            'code_challenge' => $pkceData['challenge'],
-            'code_challenge_method' => $pkceData['method'],
-            'resource' => $resourceMetadata->resource ?? $url,
-        ];
-
-        if (!empty($scopes)) {
-            $authParams['scope'] = implode(' ', $scopes);
-        }
-
-        $authUrl = $authServerMetadata->authorizationEndpoint . '?' . http_build_query($authParams);
-
-        // Store pending OAuth flow in session
-        $_SESSION['oauth_pending'][$serverId] = [
-            'state' => $state,
-            'verifier' => $pkceData['verifier'],
-            'resourceUrl' => $url,
-            'resource' => $resourceMetadata->resource ?? $url,
-            'tokenEndpoint' => $authServerMetadata->tokenEndpoint,
-            'issuer' => $authServerMetadata->issuer,
-            'clientId' => $clientId,
-            'clientSecret' => $clientSecret,
-            'httpConfig' => $httpConfig,
-            'oauthConfig' => $oauthConfig,
-            'verifyTls' => $httpConfig['verifyTls'] ?? true,
-            'startedAt' => time(),
-        ];
-
-        $this->logger->info('OAuth flow initiated', [
-            'serverId' => $serverId,
-            'authEndpoint' => $authServerMetadata->authorizationEndpoint,
-        ]);
-
-        // Return information for redirect
-        return [
-            'requiresOAuth' => true,
-            'authUrl' => $authUrl,
-            'serverId' => $serverId,
-            'message' => 'OAuth authorization required. Please authorize in the browser.',
-        ];
     }
 
     /**

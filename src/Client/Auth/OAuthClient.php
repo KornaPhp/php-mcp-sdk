@@ -30,6 +30,7 @@ use Mcp\Client\Auth\Callback\LoopbackCallbackHandler;
 use Mcp\Client\Auth\Discovery\AuthorizationServerMetadata;
 use Mcp\Client\Auth\Discovery\MetadataDiscovery;
 use Mcp\Client\Auth\Discovery\ProtectedResourceMetadata;
+use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 use Mcp\Client\Auth\Pkce\PkceGenerator;
 use Mcp\Client\Auth\Registration\ClientCredentials;
 use Mcp\Client\Auth\Registration\DynamicClientRegistration;
@@ -308,6 +309,162 @@ class OAuthClient implements OAuthClientInterface
             ]);
             return null;
         }
+    }
+
+    /**
+     * Initiate a web-based OAuth authorization flow.
+     *
+     * This method is designed for web hosting environments where the OAuth flow
+     * cannot be completed synchronously. It performs metadata discovery, client
+     * registration (if needed), and returns an AuthorizationRequest containing
+     * all data needed to complete the flow after the browser redirect.
+     *
+     * @param string $resourceUrl The protected resource URL
+     * @param array $wwwAuthHeader Parsed WWW-Authenticate header (may include resource_metadata, scope)
+     * @return AuthorizationRequest All data needed to complete the OAuth flow
+     * @throws OAuthException If metadata discovery or client registration fails
+     */
+    public function initiateWebAuthorization(
+        string $resourceUrl,
+        array $wwwAuthHeader = []
+    ): AuthorizationRequest {
+        $this->logger->info('Initiating web OAuth authorization', ['resource' => $resourceUrl]);
+
+        // Step 1: Discover Protected Resource Metadata
+        // Use resource_metadata URL from WWW-Authenticate header if provided (per MCP spec)
+        $resourceMetadataUrl = $wwwAuthHeader['resource_metadata'] ?? null;
+        $resourceMetadata = $this->discoverResourceMetadata($resourceUrl, $resourceMetadataUrl);
+
+        // Step 2: Select authorization server
+        $authServerUrl = $resourceMetadata->getPrimaryAuthorizationServer();
+        if ($authServerUrl === null) {
+            throw new OAuthException(
+                'No authorization server found in Protected Resource Metadata'
+            );
+        }
+
+        // Step 3: Discover Authorization Server Metadata
+        $authServerMetadata = $this->discoverAuthorizationServerMetadata($authServerUrl);
+
+        // Step 4: Get or register client credentials
+        $credentials = $this->getClientCredentials($authServerMetadata->issuer, $authServerMetadata);
+
+        // Step 5: Determine scopes (per MCP spec: WWW-Authenticate header has priority)
+        $scopes = $this->determineScopes($wwwAuthHeader, $resourceMetadata);
+
+        // Step 6: Generate PKCE pair
+        $pkce = $this->pkce->generate();
+
+        // Step 7: Generate state for CSRF protection
+        $state = bin2hex(random_bytes(16));
+
+        // Step 8: Determine redirect URI
+        $callback = $this->getAuthCallback();
+        $redirectUri = $this->config->getRedirectUri();
+        if ($redirectUri === null) {
+            $redirectUri = $callback->getRedirectUri();
+        }
+
+        // Step 9: Build authorization URL
+        $authParams = [
+            'response_type' => 'code',
+            'client_id' => $credentials->clientId,
+            'redirect_uri' => $redirectUri,
+            'state' => $state,
+            'code_challenge' => $pkce['challenge'],
+            'code_challenge_method' => $pkce['method'],
+            // RFC8707: Resource Indicators
+            'resource' => $resourceMetadata->resource,
+        ];
+
+        if (!empty($scopes)) {
+            $authParams['scope'] = implode(' ', $scopes);
+        }
+
+        $authUrl = $authServerMetadata->authorizationEndpoint . '?' . http_build_query($authParams);
+
+        $this->logger->debug('Built authorization URL for web flow', [
+            'authorization_endpoint' => $authServerMetadata->authorizationEndpoint,
+            'scopes' => $scopes,
+        ]);
+
+        // Return AuthorizationRequest with all data needed for token exchange
+        return new AuthorizationRequest(
+            authorizationUrl: $authUrl,
+            state: $state,
+            codeVerifier: $pkce['verifier'],
+            redirectUri: $redirectUri,
+            resourceUrl: $resourceUrl,
+            resource: $resourceMetadata->resource,
+            tokenEndpoint: $authServerMetadata->tokenEndpoint,
+            issuer: $authServerMetadata->issuer,
+            clientId: $credentials->clientId,
+            clientSecret: $credentials->clientSecret,
+            tokenEndpointAuthMethod: $credentials->tokenEndpointAuthMethod,
+            resourceMetadataUrl: $resourceMetadataUrl
+        );
+    }
+
+    /**
+     * Exchange an authorization code for tokens.
+     *
+     * This method is designed for web hosting environments where the OAuth flow
+     * is completed in two phases. It uses the data from an AuthorizationRequest
+     * to exchange the authorization code for tokens.
+     *
+     * @param AuthorizationRequest $request The authorization request data
+     * @param string $code The authorization code received from the callback
+     * @return TokenSet The obtained tokens
+     * @throws OAuthException If token exchange fails
+     */
+    public function exchangeCodeForTokens(
+        AuthorizationRequest $request,
+        string $code
+    ): TokenSet {
+        $this->logger->info('Exchanging authorization code for tokens', [
+            'resource' => $request->resourceUrl,
+        ]);
+
+        // Build credentials from AuthorizationRequest
+        $credentials = new ClientCredentials(
+            clientId: $request->clientId,
+            clientSecret: $request->clientSecret,
+            tokenEndpointAuthMethod: $request->tokenEndpointAuthMethod
+        );
+
+        // Build token request parameters
+        $tokenParams = array_merge(
+            [
+                'grant_type' => 'authorization_code',
+                'code' => $code,
+                'redirect_uri' => $request->redirectUri,
+                'code_verifier' => $request->codeVerifier,
+                // RFC8707: Include resource in token request
+                'resource' => $request->resource,
+            ],
+            $credentials->getTokenRequestParams()
+        );
+
+        // Execute token request (handles client_secret_post vs client_secret_basic)
+        $tokenResponse = $this->executeTokenRequest(
+            $request->tokenEndpoint,
+            $tokenParams,
+            $credentials
+        );
+
+        // Create TokenSet from response
+        $tokens = TokenSet::fromTokenResponse(
+            $tokenResponse,
+            $request->resourceUrl,
+            $request->issuer
+        );
+
+        // Store tokens
+        $this->config->getTokenStorage()->store($request->resourceUrl, $tokens);
+
+        $this->logger->info('Token exchange completed successfully');
+
+        return $tokens;
     }
 
     /**
