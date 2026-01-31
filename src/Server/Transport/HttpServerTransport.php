@@ -880,6 +880,17 @@ class HttpServerTransport implements Transport
     /**
      * Perform OAuth authorization for the given request if enabled.
      *
+     * Validates the Bearer token from the Authorization header. The validation includes:
+     * - Token signature verification (via the configured TokenValidator)
+     * - Issuer (iss) and audience (aud) claim validation
+     * - Token expiration (exp) checking
+     * - Optional: Scope claim validation (if 'required_scope' is configured)
+     *
+     * Security Note: The audience (aud) claim validation is the primary access control
+     * mechanism. It ensures that only tokens explicitly issued for this MCP server
+     * are accepted. Scope checking provides additional fine-grained access control
+     * but is optional since the aud claim already restricts token usage.
+     *
      * @return HttpMessage|null A response on failure or null on success.
      */
     private function authorizeRequest(HttpMessage $request, HttpSession $session): ?HttpMessage
@@ -888,6 +899,7 @@ class HttpServerTransport implements Transport
             return null;
         }
 
+        // Check for Bearer token in Authorization header
         $authHeader = $request->getHeader('Authorization');
         if ($authHeader === null || !preg_match('/^Bearer\s+(\S+)/i', $authHeader, $m)) {
             $url = $this->getResourceMetadataUrl($request);
@@ -895,22 +907,41 @@ class HttpServerTransport implements Transport
                 ->setHeader('WWW-Authenticate', 'Bearer resource_metadata="' . $url . '"');
         }
 
+        // Get the token validator
         $validator = $this->validator ?? $this->config->getTokenValidator();
         if ($validator === null) {
             return HttpMessage::createJsonResponse(['error' => 'No token validator configured'], 500);
         }
 
+        // Validate the token (signature, iss, aud, exp, etc.)
         $result = $validator->validate($m[1]);
         if (!$result->valid) {
             $url = $this->getResourceMetadataUrl($request);
-            return HttpMessage::createEmptyResponse(401)
-                ->setHeader('WWW-Authenticate', 'Bearer error="invalid_token" resource_metadata="' . $url . '"');
+            $errorDesc = $result->error ?? 'invalid_token';
+            return HttpMessage::createJsonResponse([
+                'error' => 'invalid_token',
+                'error_description' => $errorDesc
+            ], 401)
+                ->setHeader('WWW-Authenticate', 'Bearer error="invalid_token", error_description="' . addslashes($errorDesc) . '", resource_metadata="' . $url . '"');
         }
 
-        if (!isset($result->claims['scope']) || strpos((string)$result->claims['scope'], 'mcp') === false) {
-            return HttpMessage::createEmptyResponse(403);
+        // Optional: Check for required scope if configured
+        // By default, scope checking is disabled. The audience (aud) claim validation
+        // already ensures the token was issued for this specific API.
+        $requiredScope = $this->config->get('required_scope');
+        if ($requiredScope !== null && $requiredScope !== '' && $requiredScope !== false) {
+            $tokenScope = $result->claims['scope'] ?? '';
+            if (strpos((string)$tokenScope, (string)$requiredScope) === false) {
+                return HttpMessage::createJsonResponse([
+                    'error' => 'insufficient_scope',
+                    'error_description' => "Token missing required scope: {$requiredScope}",
+                    'required_scope' => $requiredScope
+                ], 403)
+                    ->setHeader('WWW-Authenticate', 'Bearer error="insufficient_scope", scope="' . $requiredScope . '"');
+            }
         }
 
+        // Store the validated claims in the session for later use
         $session->setMetadata('oauth_claims', $result->claims);
         return null;
     }

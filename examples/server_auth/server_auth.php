@@ -286,17 +286,26 @@ require_once __DIR__ . '/mcp-config.php';
 
 // === AUTHORIZATION CONFIGURATION ===
 // Configuration is loaded from mcp-config.php
-$JWT_SECRET = MCP_JWT_SECRET;
-$AUTH_ISSUER = MCP_AUTH_ISSUER;
-$RESOURCE_ID = MCP_RESOURCE_ID;
 
-// Create JWT validator
-$tokenValidator = new JwtTokenValidator(
-    key: $JWT_SECRET,
-    algorithm: 'HS256',
-    issuer: $AUTH_ISSUER,
-    audience: $RESOURCE_ID
-);
+// Create JWT validator based on algorithm
+if (MCP_JWT_ALGORITHM === 'RS256') {
+    // RS256 with JWKS (Auth0, Okta, Keycloak, etc.)
+    $tokenValidator = new JwtTokenValidator(
+        key: '',  // Not used for JWKS-based validation
+        algorithm: 'RS256',
+        issuer: MCP_AUTH_ISSUER,
+        audience: MCP_RESOURCE_ID,
+        jwksUri: MCP_JWKS_URI
+    );
+} else {
+    // HS256 with shared secret
+    $tokenValidator = new JwtTokenValidator(
+        key: MCP_JWT_SECRET,
+        algorithm: 'HS256',
+        issuer: MCP_AUTH_ISSUER,
+        audience: MCP_RESOURCE_ID
+    );
+}
 
 // Configure HTTP options
 $httpOptions = [
@@ -305,9 +314,9 @@ $httpOptions = [
     'enable_sse' => false,     // No SSE for compatibility
     'shared_hosting' => true,  // Assume shared hosting for max compatibility
     'server_header' => 'MCP-PHP-Server/1.0',
-    'auth_enabled' => true, // Enable authentication
-    'authorization_servers' => [$AUTH_ISSUER],
-    'resource' => $RESOURCE_ID,
+    'auth_enabled' => true,    // Enable authentication
+    'authorization_servers' => [MCP_AUTH_ISSUER],
+    'resource' => MCP_RESOURCE_ID,
     'token_validator' => $tokenValidator,
 ];
 
