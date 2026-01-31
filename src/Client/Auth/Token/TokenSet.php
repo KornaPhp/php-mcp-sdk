@@ -135,12 +135,15 @@ class TokenSet
      * @param array $response The token endpoint response
      * @param string|null $resourceUrl The protected resource URL
      * @param string|null $issuer The authorization server issuer
+     * @param array $originalScope Original scopes to preserve on refresh per RFC 6749 Section 6.
+     *        If the response doesn't include a scope, the original scopes are preserved.
      * @return self
      */
     public static function fromTokenResponse(
         array $response,
         ?string $resourceUrl = null,
-        ?string $issuer = null
+        ?string $issuer = null,
+        array $originalScope = []
     ): self {
         $expiresAt = null;
         if (isset($response['expires_in'])) {
@@ -150,6 +153,10 @@ class TokenSet
         $scope = [];
         if (isset($response['scope'])) {
             $scope = explode(' ', $response['scope']);
+        } elseif (!empty($originalScope)) {
+            // RFC 6749 Section 6: If the scope is omitted in the refresh response,
+            // the originally granted scopes should be preserved
+            $scope = $originalScope;
         }
 
         return new self(

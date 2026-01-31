@@ -85,9 +85,17 @@ class OAuthClient implements OAuthClientInterface
     ) {
         $this->config = $config;
         $this->logger = $logger ?? new NullLogger();
-        $this->discovery = new MetadataDiscovery($config->getTimeout(), $this->logger);
+        $this->discovery = new MetadataDiscovery(
+            $config->getTimeout(),
+            $config->isVerifyTlsEnabled(),
+            $this->logger
+        );
         $this->pkce = new PkceGenerator();
-        $this->dcr = new DynamicClientRegistration($config->getTimeout(), $this->logger);
+        $this->dcr = new DynamicClientRegistration(
+            $config->getTimeout(),
+            $config->isVerifyTlsEnabled(),
+            $this->logger
+        );
     }
 
     /**
@@ -221,7 +229,8 @@ class OAuthClient implements OAuthClientInterface
         $newTokens = TokenSet::fromTokenResponse(
             $response,
             $tokens->resourceUrl,
-            $issuer
+            $issuer,
+            $tokens->scope  // Preserve original scopes per RFC 6749 Section 6
         );
 
         // If no new refresh token was issued, keep the old one
@@ -752,8 +761,8 @@ class OAuthClient implements OAuthClientInterface
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => (int) $this->config->getTimeout(),
             CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_SSL_VERIFYPEER => $this->config->isVerifyTlsEnabled(),
+            CURLOPT_SSL_VERIFYHOST => $this->config->isVerifyTlsEnabled() ? 2 : 0,
         ]);
 
         $response = curl_exec($ch);

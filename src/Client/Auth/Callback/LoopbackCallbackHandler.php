@@ -35,6 +35,27 @@ use Psr\Log\NullLogger;
  * Opens a temporary HTTP server on 127.0.0.1 to receive the OAuth callback.
  * Suitable for CLI applications. Opens the authorization URL in the default
  * browser or prints it for manual navigation.
+ *
+ * IMPORTANT: This handler is designed for CLI applications ONLY.
+ *
+ * This handler is NOT compatible with web hosting environments (Apache, nginx, cPanel)
+ * because it requires:
+ * - PHP socket permissions (socket_create, socket_bind, socket_listen)
+ * - Long-running processes that block waiting for OAuth callback
+ * - Direct console output for user interaction
+ *
+ * For web hosting environments, use the asynchronous OAuth flow instead:
+ *
+ * 1. Call OAuthClient::initiateWebAuthorization() to get an AuthorizationRequest
+ *    containing the authorization URL and all data needed for token exchange.
+ *
+ * 2. Redirect the user's browser to the authorization URL.
+ *
+ * 3. In your OAuth callback endpoint, call OAuthClient::exchangeCodeForTokens()
+ *    with the AuthorizationRequest data and the authorization code.
+ *
+ * See the webclient/ directory for a complete reference implementation of the
+ * web-based OAuth flow, including session handling and token storage.
  */
 class LoopbackCallbackHandler implements AuthorizationCallbackInterface
 {

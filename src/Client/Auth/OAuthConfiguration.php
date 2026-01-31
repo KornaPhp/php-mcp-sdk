@@ -44,7 +44,9 @@ class OAuthConfiguration
      * Create OAuth configuration.
      *
      * @param ClientCredentials|null $clientCredentials Pre-registered client credentials
-     * @param TokenStorageInterface|null $tokenStorage Token persistence storage
+     * @param TokenStorageInterface|null $tokenStorage Token persistence storage.
+     *        NOTE: Default MemoryTokenStorage only persists tokens for the PHP
+     *        process lifetime. For web applications, use FileTokenStorage instead.
      * @param AuthorizationCallbackInterface|null $authCallback Handler for user authorization
      * @param bool $enableCimd Enable Client ID Metadata Document support
      * @param bool $enableDynamicRegistration Enable Dynamic Client Registration
@@ -54,6 +56,7 @@ class OAuthConfiguration
      * @param bool $autoRefresh Automatically refresh expiring tokens
      * @param int $refreshBuffer Seconds before expiry to trigger refresh
      * @param string|null $redirectUri Override redirect URI (default: from callback handler)
+     * @param bool $verifyTls Whether to verify TLS certificates (default: true for security)
      */
     public function __construct(
         private ?ClientCredentials $clientCredentials = null,
@@ -66,9 +69,22 @@ class OAuthConfiguration
         private float $timeout = 30.0,
         private bool $autoRefresh = true,
         private int $refreshBuffer = 60,
-        private ?string $redirectUri = null
+        private ?string $redirectUri = null,
+        private bool $verifyTls = true
     ) {
-        $this->tokenStorage = $tokenStorage ?? new MemoryTokenStorage();
+        if ($tokenStorage === null) {
+            // Warn about MemoryTokenStorage in web contexts
+            if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+                trigger_error(
+                    'OAuthConfiguration: MemoryTokenStorage in web context will lose tokens between requests. ' .
+                    'Use FileTokenStorage for web applications.',
+                    E_USER_NOTICE
+                );
+            }
+            $this->tokenStorage = new MemoryTokenStorage();
+        } else {
+            $this->tokenStorage = $tokenStorage;
+        }
     }
 
     /**
@@ -173,5 +189,13 @@ class OAuthConfiguration
     public function hasCimd(): bool
     {
         return $this->enableCimd && $this->cimdUrl !== null;
+    }
+
+    /**
+     * Check if TLS verification is enabled.
+     */
+    public function isVerifyTlsEnabled(): bool
+    {
+        return $this->verifyTls;
     }
 }

@@ -44,6 +44,7 @@ class MetadataDiscovery
 {
     private LoggerInterface $logger;
     private float $timeout;
+    private bool $verifyTls;
 
     /**
      * Maximum number of redirects to follow.
@@ -52,13 +53,16 @@ class MetadataDiscovery
 
     /**
      * @param float $timeout HTTP request timeout in seconds
+     * @param bool $verifyTls Whether to verify TLS certificates
      * @param LoggerInterface|null $logger PSR-3 logger
      */
     public function __construct(
         float $timeout = 30.0,
+        bool $verifyTls = true,
         ?LoggerInterface $logger = null
     ) {
         $this->timeout = $timeout;
+        $this->verifyTls = $verifyTls;
         $this->logger = $logger ?? new NullLogger();
     }
 
@@ -272,8 +276,8 @@ class MetadataDiscovery
                 CURLOPT_HTTPHEADER => [
                     'Accept: application/json',
                 ],
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_SSL_VERIFYPEER => $this->verifyTls,
+                CURLOPT_SSL_VERIFYHOST => $this->verifyTls ? 2 : 0,
                 CURLOPT_HEADER => true,
             ]);
 
@@ -299,7 +303,8 @@ class MetadataDiscovery
                 // Validate redirect security
                 $this->validateRedirect($currentUrl, $location, $originalHost, $originalScheme);
 
-                $currentUrl = $location;
+                // Resolve relative URLs against current URL
+                $currentUrl = $this->resolveRedirectUrl($currentUrl, $location);
                 $redirectCount++;
                 continue;
             }
@@ -334,6 +339,42 @@ class MetadataDiscovery
             return trim($matches[1]);
         }
         return null;
+    }
+
+    /**
+     * Resolve a redirect URL against the current URL.
+     *
+     * Handles both absolute URLs and relative URLs (including path-relative
+     * and absolute-path references) per RFC 3986.
+     *
+     * @param string $baseUrl The current URL being redirected from
+     * @param string $relativeUrl The Location header value (may be relative or absolute)
+     * @return string The resolved absolute URL
+     */
+    private function resolveRedirectUrl(string $baseUrl, string $relativeUrl): string
+    {
+        // If already absolute, return as-is
+        if (preg_match('/^https?:\/\//i', $relativeUrl)) {
+            return $relativeUrl;
+        }
+
+        $baseParsed = parse_url($baseUrl);
+        $scheme = $baseParsed['scheme'] ?? 'https';
+        $host = $baseParsed['host'] ?? '';
+        $port = isset($baseParsed['port']) ? ":{$baseParsed['port']}" : '';
+
+        // Handle absolute path (starts with /)
+        if (str_starts_with($relativeUrl, '/')) {
+            return "{$scheme}://{$host}{$port}{$relativeUrl}";
+        }
+
+        // Handle relative path
+        $basePath = $baseParsed['path'] ?? '/';
+        $baseDir = dirname($basePath);
+        if ($baseDir === '\\' || $baseDir === '.') {
+            $baseDir = '/';
+        }
+        return "{$scheme}://{$host}{$port}" . rtrim($baseDir, '/') . '/' . $relativeUrl;
     }
 
     /**

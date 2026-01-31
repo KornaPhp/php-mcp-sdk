@@ -43,6 +43,7 @@ use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthException;
 use Mcp\Client\Auth\Registration\ClientCredentials;
+use Mcp\Client\Auth\Token\TokenSet;
 
 class McpWebClient {
     /** @var Client */
@@ -64,6 +65,58 @@ class McpWebClient {
         }
         if (!isset($_SESSION['oauth_completed'])) {
             $_SESSION['oauth_completed'] = [];
+        }
+    }
+
+    /**
+     * Proactively refresh tokens if they will expire soon.
+     *
+     * @param string $url The resource URL
+     * @param array|null $oauthConfig OAuth configuration from connection
+     * @return TokenSet|null Refreshed tokens, or null if refresh not needed/possible
+     */
+    private function proactiveTokenRefresh(string $url, ?array $oauthConfig): ?TokenSet
+    {
+        $tokenStorage = createTokenStorage();
+        $tokens = $tokenStorage->retrieve($url);
+
+        // No tokens, or tokens can't be refreshed, or not expiring soon
+        if ($tokens === null || !$tokens->canRefresh() || !$tokens->willExpireSoon(60)) {
+            return null;
+        }
+
+        $this->logger->info('Proactively refreshing expiring token', ['url' => $url]);
+
+        try {
+            // Build client credentials if provided
+            $clientCredentials = null;
+            if ($oauthConfig !== null && !empty($oauthConfig['clientId'])) {
+                $clientCredentials = new ClientCredentials(
+                    clientId: $oauthConfig['clientId'],
+                    clientSecret: $oauthConfig['clientSecret'] ?? null,
+                    tokenEndpointAuthMethod: $oauthConfig['tokenEndpointAuthMethod']
+                        ?? ClientCredentials::AUTH_METHOD_CLIENT_SECRET_POST
+                );
+            }
+
+            $oauthConfigObj = new OAuthConfiguration(
+                clientCredentials: $clientCredentials,
+                tokenStorage: $tokenStorage,
+                authCallback: new WebCallbackHandler(getCallbackUrl()),
+                redirectUri: getCallbackUrl()
+            );
+
+            $oauthClient = new OAuthClient($oauthConfigObj, $this->logger);
+            $newTokens = $oauthClient->refreshToken($tokens);
+
+            $this->logger->info('Token refreshed successfully', ['url' => $url]);
+            return $newTokens;
+        } catch (OAuthException $e) {
+            $this->logger->warning('Proactive token refresh failed: ' . $e->getMessage(), ['url' => $url]);
+            return null;
+        } catch (\Exception $e) {
+            $this->logger->warning('Token refresh error: ' . $e->getMessage(), ['url' => $url]);
+            return null;
         }
     }
 
@@ -134,10 +187,20 @@ class McpWebClient {
         $tokenStorage = createTokenStorage();
         $existingTokens = $tokenStorage->retrieve($url);
 
-        if ($existingTokens !== null && !$existingTokens->isExpired()) {
-            // We have valid tokens, add them to headers
-            $headers['Authorization'] = $existingTokens->getAuthorizationHeader();
-            $this->logger->info('Using existing OAuth tokens', ['url' => $url]);
+        if ($existingTokens !== null) {
+            // Proactively refresh if tokens are expiring soon
+            if ($existingTokens->willExpireSoon(60) && $existingTokens->canRefresh()) {
+                $refreshed = $this->proactiveTokenRefresh($url, $oauthConfig);
+                if ($refreshed !== null) {
+                    $existingTokens = $refreshed;
+                }
+            }
+
+            // Use tokens if still valid
+            if (!$existingTokens->isExpired()) {
+                $headers['Authorization'] = $existingTokens->getAuthorizationHeader();
+                $this->logger->info('Using existing OAuth tokens', ['url' => $url]);
+            }
         }
 
         // Build HTTP options for the client
@@ -492,8 +555,20 @@ class McpWebClient {
         // Add OAuth tokens if available
         $tokenStorage = createTokenStorage();
         $tokens = $tokenStorage->retrieve($url);
-        if ($tokens !== null && !$tokens->isExpired()) {
-            $headers['Authorization'] = $tokens->getAuthorizationHeader();
+        if ($tokens !== null) {
+            // Proactively refresh if tokens are expiring soon
+            if ($tokens->willExpireSoon(60) && $tokens->canRefresh()) {
+                $oauthConfig = $serverInfo['oauthConfig'] ?? null;
+                $refreshed = $this->proactiveTokenRefresh($url, $oauthConfig);
+                if ($refreshed !== null) {
+                    $tokens = $refreshed;
+                }
+            }
+
+            // Use tokens if still valid
+            if (!$tokens->isExpired()) {
+                $headers['Authorization'] = $tokens->getAuthorizationHeader();
+            }
         }
 
         try {

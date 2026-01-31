@@ -173,9 +173,24 @@ class FileTokenStorage implements TokenStorageInterface
      */
     private function getFilename(string $url): string
     {
-        // Create a safe filename from the URL hash
-        $hash = hash('sha256', $url);
+        // Normalize URL before hashing to ensure consistent storage/retrieval
+        $normalized = $this->normalizeUrl($url);
+        $hash = hash('sha256', $normalized);
         return $this->storagePath . DIRECTORY_SEPARATOR . $hash . '.token';
+    }
+
+    /**
+     * Normalize a URL for consistent storage key generation.
+     *
+     * Removes trailing slashes to ensure URLs with and without
+     * trailing slashes map to the same storage key.
+     *
+     * @param string $url The URL to normalize
+     * @return string The normalized URL
+     */
+    private function normalizeUrl(string $url): string
+    {
+        return rtrim($url, '/');
     }
 
     /**

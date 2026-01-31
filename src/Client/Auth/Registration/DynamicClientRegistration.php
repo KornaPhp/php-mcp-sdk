@@ -42,16 +42,20 @@ class DynamicClientRegistration
 {
     private LoggerInterface $logger;
     private float $timeout;
+    private bool $verifyTls;
 
     /**
      * @param float $timeout HTTP request timeout in seconds
+     * @param bool $verifyTls Whether to verify TLS certificates
      * @param LoggerInterface|null $logger PSR-3 logger
      */
     public function __construct(
         float $timeout = 30.0,
+        bool $verifyTls = true,
         ?LoggerInterface $logger = null
     ) {
         $this->timeout = $timeout;
+        $this->verifyTls = $verifyTls;
         $this->logger = $logger ?? new NullLogger();
     }
 
@@ -101,8 +105,8 @@ class DynamicClientRegistration
                 'Content-Type: application/json',
                 'Accept: application/json',
             ],
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_SSL_VERIFYPEER => $this->verifyTls,
+            CURLOPT_SSL_VERIFYHOST => $this->verifyTls ? 2 : 0,
         ]);
 
         $response = curl_exec($ch);
