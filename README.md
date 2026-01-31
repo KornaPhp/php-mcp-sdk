@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-This package provides a PHP implementation of the [Model Context Protocol](https://modelcontextprotocol.io), allowing applications to provide context for LLMs in a standardized way. It separates the concerns of providing context from the actual LLM interaction.
+This package provides a PHP implementation of the [Model Context Protocol](https://modelcontextprotocol.io). The primary goal of this project is to provide both a MCP server and a MCP client using pure PHP, making it easy to use in PHP/Apache/cPanel hosting environments with typical server configurations.
 
 ## Overview
 
@@ -220,7 +220,7 @@ This MCP Web Client is intended for developers to test MCP servers, and it is no
 
 While MCP is usually implemented as a stateful session protocol, a typical PHP-based web hosting environment restricts long-running processes. To maximize compatibility, the MCP Web Client will initialize a new connection between the client and server for every request, and then close that connection after the request is complete.
 
-## OAuth Authorization (Currently In Testing)
+## OAuth Authorization
 
 The HTTP server transport includes optional OAuth 2.1 support. For more details see the [OAuth Authentication Example](examples/server_auth/README.md).
 
@@ -228,9 +228,9 @@ The HTTP server transport includes optional OAuth 2.1 support. For more details 
 
 For detailed information about the Model Context Protocol, visit the [official documentation](https://modelcontextprotocol.io).
 
-## 2025-03-26 Implementation
+## Latest Updates
 
-We are currently implementing the 2025-03-26 revision of the MCP Spec.
+The SDK currently support the 2025-03-26 revision of the MCP Spec.
 
 ### Completed Tasks
 - Implement protocol version negotiation
@@ -238,9 +238,10 @@ We are currently implementing the 2025-03-26 revision of the MCP Spec.
 - Add support for JSON-RPC batching
 - Implement HTTP transport
 - Implement server side authorization framework based on OAuth 2.1
+- Implement client side authorization framework based on OAuth 2.1
 
 ### In Development
-- Implement client side authorization framework based on OAuth 2.1
+- Implement 2025-11-25 revision of the MCP Spec.
 
 ## Credits
 

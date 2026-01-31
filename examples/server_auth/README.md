@@ -37,13 +37,15 @@ Edit `mcp-config.php` with your specific values:
 
 ```php
 // Set configuration constants
+define('MCP_JWT_ALGORITHM', 'HS256');
 define('MCP_JWT_SECRET', 'test-secret-key-change-in-production');
-define('MCP_AUTH_ISSUER', 'https://example.com/auth_server');
+define('MCP_AUTH_ISSUER', 'https://example_auth_server.com/');
 define('MCP_RESOURCE_ID', 'https://yoursite.com/server_auth.php');
 ```
 
 **Important Configuration Notes:**
 
+- **`MCP_JWT_ALGORITHM`**: HS256 can be used with generate-token.php while RS256 is recommended for production.
 - **`MCP_JWT_SECRET`**: Replace with a strong, random secret key. Use at least 32 characters.
 - **`MCP_AUTH_ISSUER`**: URL of your OAuth authorization server
 - **`MCP_RESOURCE_ID`**: Full URL to your MCP server endpoint (server_auth.php)
