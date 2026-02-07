@@ -34,8 +34,10 @@ use Mcp\Client\Transport\StdioServerParameters;
 use Mcp\Client\Transport\StdioTransport;
 use Mcp\Client\Transport\StreamableHttpTransport;
 use Mcp\Client\Transport\HttpConfiguration;
+use Mcp\Client\Transport\HttpSessionManager;
 use Mcp\Client\ClientSession;
 use Mcp\Shared\MemoryStream;
+use Mcp\Types\InitializeResult;
 use Mcp\Types\JsonRpcMessage;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -160,6 +162,14 @@ class Client {
             $this->session->initialize();
             $this->logger->info('Session initialized successfully');
 
+            // For HTTP transports, feed the negotiated protocol version back to
+            // the session manager so it's included in subsequent request headers
+            if ($this->transport instanceof StreamableHttpTransport) {
+                $this->transport->getSessionManager()->setProtocolVersion(
+                    $this->session->getNegotiatedProtocolVersion()
+                );
+            }
+
             return $this->session;
         } catch (\Exception $e) {
             $this->logger->error("Connection failed: {$e->getMessage()}");
@@ -262,5 +272,140 @@ class Client {
             $this->logger->info('Transport closed successfully');
             $this->transport = null;
         }
+    }
+
+    /**
+     * Resume an existing HTTP session without performing initialization handshake.
+     *
+     * Reconstructs the transport with restored session state and creates a
+     * ClientSession that is immediately ready for operations.
+     *
+     * @param string $url The HTTP(S) URL of the MCP server
+     * @param array $sessionManagerState Session manager state from toArray()
+     * @param array $initResultData InitializeResult data (serialized)
+     * @param string $negotiatedProtocolVersion The negotiated protocol version
+     * @param int $nextRequestId The next request ID counter value
+     * @param array $headers HTTP headers
+     * @param array $httpOptions HTTP configuration options
+     * @return ClientSession The restored client session ready for operations
+     */
+    public function resumeHttpSession(
+        string $url,
+        array $sessionManagerState,
+        array $initResultData,
+        string $negotiatedProtocolVersion,
+        int $nextRequestId,
+        array $headers = [],
+        array $httpOptions = []
+    ): ClientSession {
+        try {
+            // Restore session manager from persisted state
+            $sessionManager = HttpSessionManager::fromArray($sessionManagerState, $this->logger);
+
+            // Extract OAuth configuration if provided
+            $oauthConfig = null;
+            if (isset($httpOptions['oauth']) && $httpOptions['oauth'] instanceof OAuthConfiguration) {
+                $oauthConfig = $httpOptions['oauth'];
+            }
+
+            // Create HTTP configuration
+            $httpConfig = new HttpConfiguration(
+                endpoint: $url,
+                headers: $headers,
+                connectionTimeout: $httpOptions['connectionTimeout'] ?? 30.0,
+                readTimeout: $httpOptions['readTimeout'] ?? 60.0,
+                sseIdleTimeout: $httpOptions['sseIdleTimeout'] ?? 300.0,
+                enableSse: $httpOptions['enableSse'] ?? true,
+                maxRetries: $httpOptions['maxRetries'] ?? 3,
+                retryDelay: $httpOptions['retryDelay'] ?? 0.5,
+                verifyTls: $httpOptions['verifyTls'] ?? true,
+                caFile: $httpOptions['caFile'] ?? null,
+                curlOptions: $httpOptions['curlOptions'] ?? [],
+                oauthConfig: $oauthConfig
+            );
+
+            // Set the negotiated protocol version on the session manager
+            $sessionManager->setProtocolVersion($negotiatedProtocolVersion);
+
+            // Create transport with restored session manager
+            $transport = new StreamableHttpTransport(
+                config: $httpConfig,
+                autoSse: $httpOptions['autoSse'] ?? true,
+                logger: $this->logger,
+                sessionManager: $sessionManager
+            );
+            $this->transport = $transport;
+
+            // Connect transport to get read/write streams
+            [$readStream, $writeStream] = $transport->connect();
+
+            // Restore InitializeResult from serialized data
+            $initResult = InitializeResult::fromResponseData($initResultData);
+
+            // Create restored session (no handshake)
+            $this->session = ClientSession::createRestored(
+                readStream: $readStream,
+                writeStream: $writeStream,
+                initResult: $initResult,
+                negotiatedProtocolVersion: $negotiatedProtocolVersion,
+                nextRequestId: $nextRequestId,
+                readTimeout: $httpOptions['readTimeout'] ?? null,
+                logger: $this->logger
+            );
+
+            $this->logger->info('HTTP session resumed successfully', [
+                'sessionId' => $sessionManager->getSessionId(),
+            ]);
+
+            return $this->session;
+        } catch (\Exception $e) {
+            $this->logger->error("Session resume failed: {$e->getMessage()}");
+            throw new RuntimeException("Session resume failed: {$e->getMessage()}", 0, $e);
+        }
+    }
+
+    /**
+     * Detach from the transport without terminating the server-side session.
+     *
+     * Unlike close(), this preserves the server-side session for later resumption.
+     * Only works with HTTP transports.
+     *
+     * @return void
+     */
+    public function detach(): void {
+        $this->isRunning = false;
+        if ($this->session) {
+            $this->session->close();
+            $this->logger->info('Session detached');
+            $this->session = null;
+        }
+        if ($this->transport instanceof StreamableHttpTransport) {
+            $this->transport->detach();
+            $this->logger->info('Transport detached (server session preserved)');
+            $this->transport = null;
+        } elseif ($this->transport) {
+            // Non-HTTP transports fall back to close
+            $this->transport->close();
+            $this->logger->info('Transport closed (non-HTTP)');
+            $this->transport = null;
+        }
+    }
+
+    /**
+     * Get the current transport instance.
+     *
+     * @return StdioTransport|StreamableHttpTransport|null
+     */
+    public function getTransport() {
+        return $this->transport;
+    }
+
+    /**
+     * Get the current session instance.
+     *
+     * @return ClientSession|null
+     */
+    public function getSession(): ?ClientSession {
+        return $this->session;
     }
 }

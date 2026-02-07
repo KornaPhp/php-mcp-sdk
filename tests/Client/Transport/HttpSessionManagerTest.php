@@ -1,0 +1,161 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Mcp\Tests\Client\Transport;
+
+use PHPUnit\Framework\TestCase;
+use Mcp\Client\Transport\HttpSessionManager;
+
+/**
+ * Tests for HttpSessionManager serialization (toArray/fromArray).
+ *
+ * Validates that session state can be serialized and restored for
+ * persistence across PHP requests, enabling MCP session reuse.
+ */
+final class HttpSessionManagerTest extends TestCase
+{
+    /**
+     * Test round-trip serialization preserves all fields.
+     *
+     * Sets all state fields on a manager, serializes to array via toArray(),
+     * restores via fromArray(), and verifies all fields are preserved.
+     */
+    public function testRoundTripSerialization(): void
+    {
+        $manager = new HttpSessionManager();
+
+        // Simulate initialization: process response headers with a session ID
+        $manager->processResponseHeaders(
+            ['mcp-session-id' => 'test-session-123'],
+            200,
+            true
+        );
+        $manager->updateLastEventId('event-42');
+        $manager->setProtocolVersion('2025-11-25');
+
+        // Serialize
+        $data = $manager->toArray();
+
+        // Verify array structure
+        $this->assertArrayHasKey('sessionId', $data);
+        $this->assertArrayHasKey('lastEventId', $data);
+        $this->assertArrayHasKey('protocolVersion', $data);
+        $this->assertArrayHasKey('initialized', $data);
+        $this->assertArrayHasKey('invalidated', $data);
+
+        $this->assertSame('test-session-123', $data['sessionId']);
+        $this->assertSame('event-42', $data['lastEventId']);
+        $this->assertSame('2025-11-25', $data['protocolVersion']);
+        $this->assertTrue($data['initialized']);
+        $this->assertFalse($data['invalidated']);
+
+        // Restore
+        $restored = HttpSessionManager::fromArray($data);
+
+        // Verify restored state matches original
+        $this->assertSame('test-session-123', $restored->getSessionId());
+        $this->assertSame('event-42', $restored->getLastEventId());
+        $this->assertSame('2025-11-25', $restored->getProtocolVersion());
+        $this->assertTrue($restored->isInitialized());
+        $this->assertFalse($restored->isInvalidated());
+        $this->assertTrue($restored->isValid());
+    }
+
+    /**
+     * Test that restored manager produces correct request headers.
+     *
+     * The Mcp-Session-Id header must be included in all requests after
+     * session initialization. This verifies the restored manager includes it.
+     */
+    public function testRestoredManagerReturnsCorrectRequestHeaders(): void
+    {
+        $data = [
+            'sessionId' => 'restored-session-456',
+            'lastEventId' => 'evt-99',
+            'initialized' => true,
+            'invalidated' => false,
+        ];
+
+        $restored = HttpSessionManager::fromArray($data);
+        $headers = $restored->getRequestHeaders();
+
+        $this->assertArrayHasKey('Mcp-Session-Id', $headers);
+        $this->assertSame('restored-session-456', $headers['Mcp-Session-Id']);
+        $this->assertArrayHasKey('Last-Event-ID', $headers);
+        $this->assertSame('evt-99', $headers['Last-Event-ID']);
+    }
+
+    /**
+     * Test fromArray handles missing/null fields gracefully.
+     *
+     * When deserializing data that may be incomplete (e.g., from an older
+     * version), missing fields should default to safe values.
+     */
+    public function testFromArrayHandlesMissingFields(): void
+    {
+        $restored = HttpSessionManager::fromArray([]);
+
+        $this->assertNull($restored->getSessionId());
+        $this->assertNull($restored->getLastEventId());
+        $this->assertNull($restored->getProtocolVersion());
+        $this->assertFalse($restored->isInitialized());
+        $this->assertFalse($restored->isInvalidated());
+    }
+
+    /**
+     * Test that protocol version is included in request headers when set.
+     *
+     * Per the 2025-11-25 MCP spec, clients must include an MCP-Protocol-Version
+     * header on all HTTP requests after initialization.
+     */
+    public function testProtocolVersionIncludedInHeaders(): void
+    {
+        $manager = new HttpSessionManager();
+        $manager->setProtocolVersion('2025-11-25');
+
+        $headers = $manager->getRequestHeaders();
+
+        $this->assertArrayHasKey('MCP-Protocol-Version', $headers);
+        $this->assertSame('2025-11-25', $headers['MCP-Protocol-Version']);
+    }
+
+    /**
+     * Test that protocol version is preserved through toArray/fromArray serialization.
+     */
+    public function testProtocolVersionPreservedInSerialization(): void
+    {
+        $manager = new HttpSessionManager();
+        $manager->setProtocolVersion('2025-11-25');
+
+        $data = $manager->toArray();
+        $this->assertSame('2025-11-25', $data['protocolVersion']);
+
+        $restored = HttpSessionManager::fromArray($data);
+        $this->assertSame('2025-11-25', $restored->getProtocolVersion());
+
+        // Verify it also appears in headers after restoration
+        $headers = $restored->getRequestHeaders();
+        $this->assertArrayHasKey('MCP-Protocol-Version', $headers);
+        $this->assertSame('2025-11-25', $headers['MCP-Protocol-Version']);
+    }
+
+    /**
+     * Test that invalidated state is preserved through serialization.
+     */
+    public function testInvalidatedStatePreserved(): void
+    {
+        $data = [
+            'sessionId' => 'old-session',
+            'lastEventId' => null,
+            'initialized' => true,
+            'invalidated' => true,
+        ];
+
+        $restored = HttpSessionManager::fromArray($data);
+
+        $this->assertTrue($restored->isInvalidated());
+        $this->assertFalse($restored->isValid());
+        $this->assertTrue($restored->isInitialized());
+    }
+}

@@ -49,7 +49,12 @@
       * The last event ID header name for resumable SSE connections
       */
      private const LAST_EVENT_HEADER = 'Last-Event-ID';
-     
+
+     /**
+      * The MCP protocol version header name (required after initialization per 2025-11-25 spec)
+      */
+     private const PROTOCOL_VERSION_HEADER = 'MCP-Protocol-Version';
+
      /**
       * The session ID received from the server during initialization
       */
@@ -59,7 +64,12 @@
       * The ID of the last SSE event received
       */
      private ?string $lastEventId = null;
-     
+
+     /**
+      * The negotiated protocol version (set after initialization)
+      */
+     private ?string $protocolVersion = null;
+
      /**
       * Whether the session has been initialized
       */
@@ -94,7 +104,12 @@
          if ($this->lastEventId !== null) {
              $headers[self::LAST_EVENT_HEADER] = $this->lastEventId;
          }
-         
+
+         // Include protocol version if set (required after initialization)
+         if ($this->protocolVersion !== null) {
+             $headers[self::PROTOCOL_VERSION_HEADER] = $this->protocolVersion;
+         }
+
          return $headers;
      }
  
@@ -226,6 +241,25 @@
      }
  
      /**
+      * Set the negotiated protocol version.
+      *
+      * @param string $version The negotiated protocol version
+      */
+     public function setProtocolVersion(string $version): void {
+         $this->protocolVersion = $version;
+         $this->logger->debug("Set protocol version: {$version}");
+     }
+
+     /**
+      * Get the negotiated protocol version.
+      *
+      * @return string|null The protocol version or null if not set
+      */
+     public function getProtocolVersion(): ?string {
+         return $this->protocolVersion;
+     }
+
+     /**
       * Reset the session state entirely.
       * 
       * This completely clears all session state, as if creating a new instance.
@@ -233,9 +267,42 @@
      public function reset(): void {
          $this->sessionId = null;
          $this->lastEventId = null;
+         $this->protocolVersion = null;
          $this->initialized = false;
          $this->invalidated = false;
          $this->logger->info("Session state completely reset");
+     }
+
+     /**
+      * Serialize session state to an array for persistence across PHP requests.
+      *
+      * @return array Session state data
+      */
+     public function toArray(): array {
+         return [
+             'sessionId' => $this->sessionId,
+             'lastEventId' => $this->lastEventId,
+             'protocolVersion' => $this->protocolVersion,
+             'initialized' => $this->initialized,
+             'invalidated' => $this->invalidated,
+         ];
+     }
+
+     /**
+      * Restore session state from a previously serialized array.
+      *
+      * @param array $data Session state data from toArray()
+      * @param LoggerInterface|null $logger PSR-3 compatible logger
+      * @return self Restored session manager
+      */
+     public static function fromArray(array $data, ?LoggerInterface $logger = null): self {
+         $manager = new self($logger ?? new NullLogger());
+         $manager->sessionId = $data['sessionId'] ?? null;
+         $manager->lastEventId = $data['lastEventId'] ?? null;
+         $manager->protocolVersion = $data['protocolVersion'] ?? null;
+         $manager->initialized = $data['initialized'] ?? false;
+         $manager->invalidated = $data['invalidated'] ?? false;
+         return $manager;
      }
  }
  

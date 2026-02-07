@@ -121,6 +121,50 @@ class ClientSession extends BaseSession {
     }
 
     /**
+     * Create a restored ClientSession that skips the initialization handshake.
+     *
+     * Used to resume a previously established MCP session (e.g., across PHP requests).
+     * The session is immediately ready for operations without sending initialize/initialized.
+     *
+     * @param MemoryStream $readStream Stream to read incoming messages from
+     * @param MemoryStream $writeStream Stream to write outgoing messages to
+     * @param InitializeResult $initResult The initialization result from the original session
+     * @param string $negotiatedProtocolVersion The protocol version negotiated in the original session
+     * @param int $nextRequestId The next request ID to use (to avoid collisions)
+     * @param float|null $readTimeout Optional read timeout in seconds
+     * @param LoggerInterface|null $logger PSR-3 compliant logger
+     * @return self A session ready for operations
+     */
+    public static function createRestored(
+        MemoryStream $readStream,
+        MemoryStream $writeStream,
+        InitializeResult $initResult,
+        string $negotiatedProtocolVersion,
+        int $nextRequestId,
+        ?float $readTimeout = null,
+        ?LoggerInterface $logger = null
+    ): self {
+        $session = new self($readStream, $writeStream, $readTimeout, $logger);
+        $session->initResult = $initResult;
+        $session->negotiatedProtocolVersion = $negotiatedProtocolVersion;
+        $session->initialized = true;
+        $session->isInitialized = true;
+        $session->setNextRequestId($nextRequestId);
+        return $session;
+    }
+
+    /**
+     * Get the current request ID counter value.
+     *
+     * Used to persist the counter across PHP requests for session resumption.
+     *
+     * @return int The next request ID that will be used
+     */
+    public function getNextRequestId(): int {
+        return parent::getNextRequestId();
+    }
+
+    /**
      * Initialize the client session by sending an InitializeRequest and then an InitializedNotification.
      *
      * @throws RuntimeException If initialization fails due to unsupported protocol version or other issues.

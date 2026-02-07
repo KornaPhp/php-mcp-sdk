@@ -101,13 +101,15 @@ class StreamableHttpTransport
      * @param HttpConfiguration $config Configuration for the HTTP transport
      * @param bool $autoSse Whether to automatically use SSE when available
      * @param LoggerInterface|null $logger PSR-3 compatible logger
+     * @param HttpSessionManager|null $sessionManager Optional pre-configured session manager for session resumption
      *
      * @throws RuntimeException If cURL extension is not available
      */
     public function __construct(
         HttpConfiguration $config,
         bool $autoSse = true,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?HttpSessionManager $sessionManager = null
     ) {
         if (!extension_loaded('curl')) {
             throw new RuntimeException('cURL extension is required for StreamableHttpTransport');
@@ -116,7 +118,7 @@ class StreamableHttpTransport
         $this->config = $config;
         $this->autoSse = $autoSse && $config->isSseEnabled();
         $this->logger = $logger ?? new NullLogger();
-        $this->sessionManager = new HttpSessionManager($this->logger);
+        $this->sessionManager = $sessionManager ?? new HttpSessionManager($this->logger);
 
         // Initialize OAuth client if configured
         if ($config->hasOAuth()) {
@@ -875,5 +877,35 @@ class StreamableHttpTransport
     public function getOAuthClient(): ?OAuthClientInterface
     {
         return $this->oauthClient;
+    }
+
+    /**
+     * Get the session manager for extracting session state.
+     *
+     * @return HttpSessionManager
+     */
+    public function getSessionManager(): HttpSessionManager
+    {
+        return $this->sessionManager;
+    }
+
+    /**
+     * Detach from the transport without terminating the server-side session.
+     *
+     * Unlike close(), this does NOT send an HTTP DELETE request to the server.
+     * The server-side session remains active for later resumption.
+     * SSE connections are closed since they cannot persist across PHP requests.
+     */
+    public function detach(): void
+    {
+        $this->logger->info('Detaching HTTP transport (preserving server session)');
+
+        // Close SSE connection if active (can't persist across PHP requests)
+        if ($this->sseConnection !== null) {
+            $this->sseConnection->stop();
+            $this->sseConnection = null;
+        }
+
+        // Do NOT send HTTP DELETE — that's the key difference from close()
     }
 }

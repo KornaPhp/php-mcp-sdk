@@ -26,9 +26,17 @@
 /**
  * MCP Web Client Wrapper
  *
- * Provides a web-friendly interface to the MCP client library by creating fresh
- * connections for each operation while maintaining server information and capabilities
- * in PHP sessions.
+ * Provides a web-friendly interface to the MCP client library.
+ *
+ * For HTTP connections, reuses MCP sessions across PHP requests by persisting
+ * session state (Mcp-Session-Id, request ID counter, init result) in $_SESSION.
+ * This avoids a full initialization handshake on every operation.
+ *
+ * For stdio connections, creates fresh connections per operation (PHP limitation:
+ * subprocesses cannot persist across HTTP requests).
+ *
+ * OAuth token management is delegated to the SDK transport when OAuthConfiguration
+ * is provided, avoiding duplicate token handling.
  *
  * Supports both local (stdio) and remote (HTTP/HTTPS) MCP servers with optional
  * OAuth 2.0/2.1 authorization.
@@ -39,11 +47,11 @@ declare(strict_types=1);
 use Monolog\Logger;
 use Mcp\Client\Client;
 use Mcp\Client\Transport\HttpAuthenticationException;
+use Mcp\Client\Transport\StreamableHttpTransport;
 use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthException;
 use Mcp\Client\Auth\Registration\ClientCredentials;
-use Mcp\Client\Auth\Token\TokenSet;
 
 class McpWebClient {
     /** @var Client */
@@ -69,55 +77,62 @@ class McpWebClient {
     }
 
     /**
-     * Proactively refresh tokens if they will expire soon.
+     * Build an OAuthConfiguration from the webclient's OAuth config array.
      *
-     * @param string $url The resource URL
-     * @param array|null $oauthConfig OAuth configuration from connection
-     * @return TokenSet|null Refreshed tokens, or null if refresh not needed/possible
+     * Centralizes OAuthConfiguration construction with SessionTokenStorage,
+     * WebCallbackHandler, and any configured client credentials.
+     *
+     * @param array|null $oauthConfig OAuth configuration from the UI
+     * @return OAuthConfiguration|null Configuration object, or null if OAuth not configured
      */
-    private function proactiveTokenRefresh(string $url, ?array $oauthConfig): ?TokenSet
-    {
+    private function buildOAuthConfiguration(?array $oauthConfig): ?OAuthConfiguration {
+        if ($oauthConfig === null || empty($oauthConfig['enabled'])) {
+            return null;
+        }
+
         $tokenStorage = createTokenStorage();
-        $tokens = $tokenStorage->retrieve($url);
 
-        // No tokens, or tokens can't be refreshed, or not expiring soon
-        if ($tokens === null || !$tokens->canRefresh() || !$tokens->willExpireSoon(60)) {
-            return null;
-        }
-
-        $this->logger->info('Proactively refreshing expiring token', ['url' => $url]);
-
-        try {
-            // Build client credentials if provided
-            $clientCredentials = null;
-            if ($oauthConfig !== null && !empty($oauthConfig['clientId'])) {
-                $clientCredentials = new ClientCredentials(
-                    clientId: $oauthConfig['clientId'],
-                    clientSecret: $oauthConfig['clientSecret'] ?? null,
-                    tokenEndpointAuthMethod: $oauthConfig['tokenEndpointAuthMethod']
-                        ?? ClientCredentials::AUTH_METHOD_CLIENT_SECRET_POST
-                );
-            }
-
-            $oauthConfigObj = new OAuthConfiguration(
-                clientCredentials: $clientCredentials,
-                tokenStorage: $tokenStorage,
-                authCallback: new WebCallbackHandler(getCallbackUrl()),
-                redirectUri: getCallbackUrl()
+        $clientCredentials = null;
+        if (!empty($oauthConfig['clientId'])) {
+            $clientCredentials = new ClientCredentials(
+                clientId: $oauthConfig['clientId'],
+                clientSecret: $oauthConfig['clientSecret'] ?? null,
+                tokenEndpointAuthMethod: $oauthConfig['tokenEndpointAuthMethod']
+                    ?? ClientCredentials::AUTH_METHOD_CLIENT_SECRET_POST
             );
-
-            $oauthClient = new OAuthClient($oauthConfigObj, $this->logger);
-            $newTokens = $oauthClient->refreshToken($tokens);
-
-            $this->logger->info('Token refreshed successfully', ['url' => $url]);
-            return $newTokens;
-        } catch (OAuthException $e) {
-            $this->logger->warning('Proactive token refresh failed: ' . $e->getMessage(), ['url' => $url]);
-            return null;
-        } catch (\Exception $e) {
-            $this->logger->warning('Token refresh error: ' . $e->getMessage(), ['url' => $url]);
-            return null;
         }
+
+        return new OAuthConfiguration(
+            clientCredentials: $clientCredentials,
+            tokenStorage: $tokenStorage,
+            authCallback: new WebCallbackHandler(getCallbackUrl()),
+            enableDynamicRegistration: true,
+            redirectUri: getCallbackUrl()
+        );
+    }
+
+    /**
+     * Store MCP session state in $_SESSION for later resumption.
+     *
+     * @param string $sessionId The webclient session ID
+     * @param string $url The server URL
+     * @param array $httpConfig HTTP configuration
+     * @param array|null $oauthConfig OAuth configuration
+     */
+    private function storeMcpSessionState(string $sessionId, string $url, array $httpConfig, ?array $oauthConfig): void {
+        $transport = $this->client->getTransport();
+        $session = $this->client->getSession();
+
+        if (!$transport instanceof StreamableHttpTransport || $session === null) {
+            return;
+        }
+
+        $initResult = $session->getInitializeResult();
+
+        $_SESSION['mcp_servers'][$sessionId]['mcpSessionState'] = $transport->getSessionManager()->toArray();
+        $_SESSION['mcp_servers'][$sessionId]['initResultData'] = json_decode(json_encode($initResult->jsonSerialize()), true);
+        $_SESSION['mcp_servers'][$sessionId]['protocolVersion'] = $session->getNegotiatedProtocolVersion();
+        $_SESSION['mcp_servers'][$sessionId]['nextRequestId'] = $session->getNextRequestId();
     }
 
     /**
@@ -167,7 +182,10 @@ class McpWebClient {
     }
 
     /**
-     * Creates a new connection to an HTTP/HTTPS MCP server
+     * Creates a new connection to an HTTP/HTTPS MCP server.
+     *
+     * Delegates OAuth token management to the SDK transport via OAuthConfiguration.
+     * After successful connection, stores MCP session state for reuse across requests.
      *
      * @param string $url The HTTP(S) URL of the MCP server
      * @param array $httpConfig HTTP configuration options
@@ -183,27 +201,7 @@ class McpWebClient {
             $headers = $this->parseHeaders($httpConfig['headers']);
         }
 
-        // Check if we have completed OAuth tokens for this server
-        $tokenStorage = createTokenStorage();
-        $existingTokens = $tokenStorage->retrieve($url);
-
-        if ($existingTokens !== null) {
-            // Proactively refresh if tokens are expiring soon
-            if ($existingTokens->willExpireSoon(60) && $existingTokens->canRefresh()) {
-                $refreshed = $this->proactiveTokenRefresh($url, $oauthConfig);
-                if ($refreshed !== null) {
-                    $existingTokens = $refreshed;
-                }
-            }
-
-            // Use tokens if still valid
-            if (!$existingTokens->isExpired()) {
-                $headers['Authorization'] = $existingTokens->getAuthorizationHeader();
-                $this->logger->info('Using existing OAuth tokens', ['url' => $url]);
-            }
-        }
-
-        // Build HTTP options for the client
+        // Build HTTP options — let SDK handle OAuth via OAuthConfiguration
         $httpOptions = [
             'connectionTimeout' => $httpConfig['connectionTimeout'] ?? 30.0,
             'readTimeout' => $httpConfig['readTimeout'] ?? 60.0,
@@ -211,8 +209,14 @@ class McpWebClient {
             'enableSse' => false, // Disable SSE for stateless web requests
         ];
 
+        // Pass OAuth configuration to SDK transport
+        $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+        if ($oauthConfigObj !== null) {
+            $httpOptions['oauth'] = $oauthConfigObj;
+        }
+
         try {
-            // Attempt connection - SDK will throw on HTTP errors (401, 403, etc.)
+            // Attempt connection - SDK handles OAuth token injection automatically
             $session = $this->client->connect($url, $headers, $httpOptions);
 
             // Get server capabilities
@@ -232,11 +236,17 @@ class McpWebClient {
                 'serverInfo' => $initResult->serverInfo
             ];
 
+            // Store MCP session state for reuse
+            $this->storeMcpSessionState($sessionId, $url, $httpConfig, $oauthConfig);
+
             $this->logger->info('HTTP server connection validated', [
                 'sessionId' => $sessionId,
                 'url' => $url,
                 'type' => 'http'
             ]);
+
+            // Detach instead of close — preserve server session
+            $this->client->detach();
 
             return [
                 'sessionId' => $sessionId,
@@ -285,12 +295,12 @@ class McpWebClient {
             $this->logger->error("HTTP connection failed: " . $e->getMessage());
             throw new RuntimeException("Failed to connect to HTTP MCP server: " . $e->getMessage(), 0, $e);
         } finally {
-            // Always cleanup the client connection
+            // Detach on error paths too (may already be detached on success)
             try {
-                $this->client->close();
+                $this->client->detach();
             } catch (\Exception $closeException) {
                 // Log but don't throw - we don't want to mask the original error
-                $this->logger->debug('Error closing client connection', [
+                $this->logger->debug('Error detaching client connection', [
                     'error' => $closeException->getMessage()
                 ]);
             }
@@ -298,7 +308,9 @@ class McpWebClient {
     }
 
     /**
-     * Complete an HTTP connection after OAuth authorization
+     * Complete an HTTP connection after OAuth authorization.
+     *
+     * Delegates OAuth to SDK transport and stores MCP session state for reuse.
      *
      * @param string $serverId The server ID from the OAuth callback
      * @return array Connection result with sessionId and capabilities
@@ -316,15 +328,7 @@ class McpWebClient {
         // Clean up completed OAuth data
         unset($_SESSION['oauth_completed'][$serverId]);
 
-        // Get tokens
-        $tokenStorage = createTokenStorage();
-        $tokens = $tokenStorage->retrieve($url);
-
-        if ($tokens === null || $tokens->isExpired()) {
-            throw new RuntimeException('OAuth tokens are missing or expired');
-        }
-
-        // Build HTTP options
+        // Build HTTP options with OAuth — let SDK handle token injection
         $httpOptions = [
             'connectionTimeout' => $httpConfig['connectionTimeout'] ?? 30.0,
             'readTimeout' => $httpConfig['readTimeout'] ?? 60.0,
@@ -332,15 +336,19 @@ class McpWebClient {
             'enableSse' => false,
         ];
 
-        // Parse custom headers and add authorization
+        $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+        if ($oauthConfigObj !== null) {
+            $httpOptions['oauth'] = $oauthConfigObj;
+        }
+
+        // Parse custom headers (no manual Authorization injection)
         $headers = [];
         if (!empty($httpConfig['headers'])) {
             $headers = $this->parseHeaders($httpConfig['headers']);
         }
-        $headers['Authorization'] = $tokens->getAuthorizationHeader();
 
         try {
-            // Attempt connection with tokens
+            // Attempt connection with OAuth handled by SDK
             $session = $this->client->connect($url, $headers, $httpOptions);
 
             // Get server capabilities
@@ -360,10 +368,16 @@ class McpWebClient {
                 'serverInfo' => $initResult->serverInfo
             ];
 
+            // Store MCP session state for reuse
+            $this->storeMcpSessionState($serverId, $url, $httpConfig, $oauthConfig);
+
             $this->logger->info('HTTP server connection completed after OAuth', [
                 'sessionId' => $serverId,
                 'url' => $url
             ]);
+
+            // Detach instead of close — preserve server session
+            $this->client->detach();
 
             return [
                 'sessionId' => $serverId,
@@ -375,11 +389,10 @@ class McpWebClient {
             $this->logger->error("HTTP connection failed after OAuth: " . $e->getMessage());
             throw new RuntimeException("Failed to connect after OAuth: " . $e->getMessage(), 0, $e);
         } finally {
-            // Always cleanup the client connection
             try {
-                $this->client->close();
+                $this->client->detach();
             } catch (\Exception $closeException) {
-                $this->logger->debug('Error closing client connection', [
+                $this->logger->debug('Error detaching client connection', [
                     'error' => $closeException->getMessage()
                 ]);
             }
@@ -406,27 +419,10 @@ class McpWebClient {
         $this->logger->info('Initiating OAuth flow using SDK', ['url' => $url]);
 
         try {
-            // Build OAuthConfiguration for the SDK
-            $tokenStorage = createTokenStorage();
-
-            // Use pre-registered credentials if provided
-            $clientCredentials = null;
-            if (!empty($oauthConfig['clientId'])) {
-                $clientCredentials = new ClientCredentials(
-                    clientId: $oauthConfig['clientId'],
-                    clientSecret: $oauthConfig['clientSecret'] ?? null,
-                    tokenEndpointAuthMethod: $oauthConfig['tokenEndpointAuthMethod']
-                        ?? ClientCredentials::AUTH_METHOD_CLIENT_SECRET_POST
-                );
+            $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+            if ($oauthConfigObj === null) {
+                throw new RuntimeException('OAuth is not configured');
             }
-
-            $oauthConfigObj = new OAuthConfiguration(
-                clientCredentials: $clientCredentials,
-                tokenStorage: $tokenStorage,
-                authCallback: new WebCallbackHandler(getCallbackUrl()),
-                enableDynamicRegistration: true,
-                redirectUri: getCallbackUrl()
-            );
 
             $oauthClient = new OAuthClient($oauthConfigObj, $this->logger);
 
@@ -492,7 +488,7 @@ class McpWebClient {
         $this->validateOperationSupport($operation, $serverInfo['capabilities']);
 
         try {
-            // Create fresh connection
+            // Create fresh connection (stdio can't persist across PHP requests)
             $session = $this->client->connect(
                 $serverInfo['command'],
                 $serverInfo['args'],
@@ -528,15 +524,122 @@ class McpWebClient {
     }
 
     /**
-     * Execute an MCP operation on an HTTP server
+     * Execute an MCP operation on an HTTP server.
+     *
+     * Reuses the MCP session if session state is stored in $_SESSION.
+     * Falls back to a full connect if no session state exists or if the
+     * server returns 404 (session expired).
+     *
+     * OAuth is handled by the SDK transport via OAuthConfiguration.
      */
     private function executeOperationHttp(string $sessionId, string $operation, array $params = []): array {
         $serverInfo = $_SESSION['mcp_servers'][$sessionId];
         $url = $serverInfo['url'];
         $httpConfig = $serverInfo['httpConfig'];
+        $oauthConfig = $serverInfo['oauthConfig'] ?? null;
 
         // Verify operation is supported (before any connection attempt)
         $this->validateOperationSupport($operation, $serverInfo['capabilities']);
+
+        // Parse custom headers
+        $headers = [];
+        if (!empty($httpConfig['headers'])) {
+            $headers = $this->parseHeaders($httpConfig['headers']);
+        }
+
+        // Build HTTP options — let SDK handle OAuth
+        $httpOptions = [
+            'connectionTimeout' => $httpConfig['connectionTimeout'] ?? 30.0,
+            'readTimeout' => $httpConfig['readTimeout'] ?? 60.0,
+            'verifyTls' => $httpConfig['verifyTls'] ?? true,
+            'enableSse' => false,
+        ];
+
+        $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+        if ($oauthConfigObj !== null) {
+            $httpOptions['oauth'] = $oauthConfigObj;
+        }
+
+        try {
+            // Try to resume existing MCP session
+            if (isset($serverInfo['mcpSessionState'])) {
+                $this->logger->info('Resuming MCP session', ['sessionId' => $sessionId]);
+                $session = $this->client->resumeHttpSession(
+                    url: $url,
+                    sessionManagerState: $serverInfo['mcpSessionState'],
+                    initResultData: $serverInfo['initResultData'],
+                    negotiatedProtocolVersion: $serverInfo['protocolVersion'],
+                    nextRequestId: $serverInfo['nextRequestId'],
+                    headers: $headers,
+                    httpOptions: $httpOptions
+                );
+            } else {
+                // No session state — full connect
+                $this->logger->info('No MCP session state, performing full connect', ['sessionId' => $sessionId]);
+                $session = $this->client->connect($url, $headers, $httpOptions);
+                $this->storeMcpSessionState($sessionId, $url, $httpConfig, $oauthConfig);
+            }
+
+            // Execute operation
+            $result = $this->dispatchOperation($session, $operation, $params);
+
+            // Update request ID counter for next operation
+            $_SESSION['mcp_servers'][$sessionId]['nextRequestId'] = $session->getNextRequestId();
+
+            // Store cacheable results
+            if (isset($result['store'])) {
+                $_SESSION['mcp_servers'][$sessionId][$result['store']] = $result['result'];
+            }
+
+            return [
+                'result' => $result['result'],
+                'logs' => $this->getRecentLogs()
+            ];
+
+        } catch (RuntimeException $e) {
+            // Handle 404 (session expired on server) — re-initialize
+            if ($e->getCode() === 404 && isset($serverInfo['mcpSessionState'])) {
+                $this->logger->info('MCP session expired (404), re-initializing', ['sessionId' => $sessionId]);
+                return $this->reInitializeAndRetry($sessionId, $operation, $params);
+            }
+            $this->logger->error("HTTP operation failed: " . $e->getMessage());
+            throw new RuntimeException("Failed to execute operation: " . $e->getMessage(), 0, $e);
+        } catch (\Exception $e) {
+            $this->logger->error("HTTP operation failed: " . $e->getMessage());
+            throw new RuntimeException("Failed to execute operation: " . $e->getMessage(), 0, $e);
+        } finally {
+            // Detach — preserve server session for next operation
+            try {
+                $this->client->detach();
+            } catch (\Exception $closeException) {
+                $this->logger->debug('Error detaching client connection', [
+                    'error' => $closeException->getMessage()
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Handle session expiry: perform full connect, update state, retry operation.
+     *
+     * Called when the server returns 404 indicating the session has expired.
+     *
+     * @param string $sessionId The webclient session ID
+     * @param string $operation The operation to retry
+     * @param array $params The operation parameters
+     * @return array The operation result
+     */
+    private function reInitializeAndRetry(string $sessionId, string $operation, array $params): array {
+        $serverInfo = $_SESSION['mcp_servers'][$sessionId];
+        $url = $serverInfo['url'];
+        $httpConfig = $serverInfo['httpConfig'];
+        $oauthConfig = $serverInfo['oauthConfig'] ?? null;
+
+        // Parse custom headers
+        $headers = [];
+        if (!empty($httpConfig['headers'])) {
+            $headers = $this->parseHeaders($httpConfig['headers']);
+        }
 
         // Build HTTP options
         $httpOptions = [
@@ -546,37 +649,32 @@ class McpWebClient {
             'enableSse' => false,
         ];
 
-        // Parse custom headers
-        $headers = [];
-        if (!empty($httpConfig['headers'])) {
-            $headers = $this->parseHeaders($httpConfig['headers']);
+        $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+        if ($oauthConfigObj !== null) {
+            $httpOptions['oauth'] = $oauthConfigObj;
         }
 
-        // Add OAuth tokens if available
-        $tokenStorage = createTokenStorage();
-        $tokens = $tokenStorage->retrieve($url);
-        if ($tokens !== null) {
-            // Proactively refresh if tokens are expiring soon
-            if ($tokens->willExpireSoon(60) && $tokens->canRefresh()) {
-                $oauthConfig = $serverInfo['oauthConfig'] ?? null;
-                $refreshed = $this->proactiveTokenRefresh($url, $oauthConfig);
-                if ($refreshed !== null) {
-                    $tokens = $refreshed;
-                }
-            }
-
-            // Use tokens if still valid
-            if (!$tokens->isExpired()) {
-                $headers['Authorization'] = $tokens->getAuthorizationHeader();
-            }
-        }
+        // Need a fresh client since previous one may be in bad state
+        $this->client = new Client($this->logger);
 
         try {
-            // Create fresh connection
+            // Full connect (new initialization handshake)
             $session = $this->client->connect($url, $headers, $httpOptions);
 
-            // Execute operation
+            // Update stored session state
+            $initResult = $session->getInitializeResult();
+            $capabilitiesArray = json_decode(json_encode($initResult->capabilities), true);
+
+            $_SESSION['mcp_servers'][$sessionId]['capabilities'] = $capabilitiesArray;
+            $_SESSION['mcp_servers'][$sessionId]['serverInfo'] = $initResult->serverInfo;
+            $_SESSION['mcp_servers'][$sessionId]['created'] = time();
+            $this->storeMcpSessionState($sessionId, $url, $httpConfig, $oauthConfig);
+
+            // Execute the operation
             $result = $this->dispatchOperation($session, $operation, $params);
+
+            // Update request ID counter
+            $_SESSION['mcp_servers'][$sessionId]['nextRequestId'] = $session->getNextRequestId();
 
             // Store cacheable results
             if (isset($result['store'])) {
@@ -589,14 +687,13 @@ class McpWebClient {
             ];
 
         } catch (\Exception $e) {
-            $this->logger->error("HTTP operation failed: " . $e->getMessage());
-            throw new RuntimeException("Failed to execute operation: " . $e->getMessage(), 0, $e);
+            $this->logger->error("Re-initialization failed: " . $e->getMessage());
+            throw new RuntimeException("Failed to re-initialize session: " . $e->getMessage(), 0, $e);
         } finally {
-            // Always cleanup connection
             try {
-                $this->client->close();
+                $this->client->detach();
             } catch (\Exception $closeException) {
-                $this->logger->debug('Error closing client connection', [
+                $this->logger->debug('Error detaching client connection', [
                     'error' => $closeException->getMessage()
                 ]);
             }
@@ -637,13 +734,65 @@ class McpWebClient {
     }
 
     /**
-     * Clean up session data
+     * Clean up session data.
+     *
+     * For HTTP sessions with stored MCP session state, resumes the session
+     * and sends HTTP DELETE to properly terminate the server-side session.
      */
     public function closeSession(string $sessionId): void {
-        // Clean up any associated tokens
         if (isset($_SESSION['mcp_servers'][$sessionId])) {
             $serverInfo = $_SESSION['mcp_servers'][$sessionId];
-            if ($serverInfo['type'] === 'http' && isset($serverInfo['url'])) {
+
+            // For HTTP sessions, properly terminate the server-side session
+            if ($serverInfo['type'] === 'http' && isset($serverInfo['mcpSessionState'])) {
+                $mcpState = $serverInfo['mcpSessionState'];
+                if (!empty($mcpState['sessionId']) && !($mcpState['invalidated'] ?? false)) {
+                    try {
+                        $url = $serverInfo['url'];
+                        $httpConfig = $serverInfo['httpConfig'];
+                        $oauthConfig = $serverInfo['oauthConfig'] ?? null;
+
+                        $headers = [];
+                        if (!empty($httpConfig['headers'])) {
+                            $headers = $this->parseHeaders($httpConfig['headers']);
+                        }
+
+                        $httpOptions = [
+                            'connectionTimeout' => $httpConfig['connectionTimeout'] ?? 30.0,
+                            'readTimeout' => $httpConfig['readTimeout'] ?? 60.0,
+                            'verifyTls' => $httpConfig['verifyTls'] ?? true,
+                            'enableSse' => false,
+                        ];
+
+                        $oauthConfigObj = $this->buildOAuthConfiguration($oauthConfig);
+                        if ($oauthConfigObj !== null) {
+                            $httpOptions['oauth'] = $oauthConfigObj;
+                        }
+
+                        // Resume session and close (sends HTTP DELETE)
+                        $this->client->resumeHttpSession(
+                            url: $url,
+                            sessionManagerState: $mcpState,
+                            initResultData: $serverInfo['initResultData'],
+                            negotiatedProtocolVersion: $serverInfo['protocolVersion'],
+                            nextRequestId: $serverInfo['nextRequestId'],
+                            headers: $headers,
+                            httpOptions: $httpOptions
+                        );
+                        $this->client->close(); // This sends HTTP DELETE
+                        $this->logger->info('Server-side MCP session terminated', ['sessionId' => $sessionId]);
+                    } catch (\Exception $e) {
+                        $this->logger->warning('Failed to terminate server session: ' . $e->getMessage());
+                    }
+                }
+
+                // Clean up OAuth tokens
+                if (isset($serverInfo['url'])) {
+                    $tokenStorage = createTokenStorage();
+                    $tokenStorage->remove($serverInfo['url']);
+                }
+            } elseif ($serverInfo['type'] === 'http' && isset($serverInfo['url'])) {
+                // No MCP session state but still clean up tokens
                 $tokenStorage = createTokenStorage();
                 $tokenStorage->remove($serverInfo['url']);
             }

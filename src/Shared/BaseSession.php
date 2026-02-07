@@ -395,6 +395,26 @@ abstract class BaseSession {
     }
 
     /**
+     * Get the current request ID counter value.
+     *
+     * @return int The next request ID that will be used
+     */
+    protected function getNextRequestId(): int {
+        return $this->requestId;
+    }
+
+    /**
+     * Set the request ID counter value.
+     *
+     * Used when restoring a session to avoid request ID collisions.
+     *
+     * @param int $id The request ID counter value to set
+     */
+    protected function setNextRequestId(int $id): void {
+        $this->requestId = $id;
+    }
+
+    /**
      * Reads the next message from the underlying transport.
      * This must be implemented by subclasses and should block until a message is available.
      */

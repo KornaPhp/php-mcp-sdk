@@ -27,8 +27,8 @@
  * OAuth 2.0 callback endpoint for the MCP Web Client.
  *
  * This endpoint receives the authorization callback from the OAuth provider,
- * exchanges the authorization code for tokens, stores them, and redirects
- * back to the main UI.
+ * exchanges the authorization code for tokens using the SDK's OAuthClient,
+ * stores them, and redirects back to the main UI.
  */
 
 declare(strict_types=1);
@@ -40,7 +40,6 @@ use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthException;
 use Mcp\Client\Auth\Registration\ClientCredentials;
-use Mcp\Client\Auth\Token\TokenSet;
 
 /**
  * Redirect to main page with status.
@@ -89,18 +88,10 @@ try {
     }
 
     // Find the pending OAuth flow matching this state
-    // Support both new format (state in authRequest) and legacy format (state at top level)
     $pendingFlow = null;
     $serverId = null;
     foreach ($_SESSION['oauth_pending'] as $sid => $flow) {
-        // New format: state is inside authRequest
         if (isset($flow['authRequest']['state']) && $flow['authRequest']['state'] === $state) {
-            $pendingFlow = $flow;
-            $serverId = $sid;
-            break;
-        }
-        // Legacy format: state at top level
-        if (isset($flow['state']) && $flow['state'] === $state) {
             $pendingFlow = $flow;
             $serverId = $sid;
             break;
@@ -121,141 +112,45 @@ try {
 
     $logger->info('Processing OAuth callback', ['serverId' => $serverId]);
 
-    // Check if we have the new AuthorizationRequest format or legacy format
-    if (isset($pendingFlow['authRequest'])) {
-        // New format: use AuthorizationRequest from SDK
-        try {
-            $authRequest = AuthorizationRequest::fromArray($pendingFlow['authRequest']);
-        } catch (\InvalidArgumentException $e) {
-            $logger->error('Invalid authorization request data', ['error' => $e->getMessage()]);
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, 'Invalid authorization request data');
-        }
+    // Restore AuthorizationRequest from session
+    if (!isset($pendingFlow['authRequest'])) {
+        $logger->error('Missing authorization request data');
+        unset($_SESSION['oauth_pending'][$serverId]);
+        redirectToMain(false, 'Missing authorization request data. Please try connecting again.');
+    }
 
-        // Create OAuthConfiguration for the SDK
-        $tokenStorage = createTokenStorage();
-        $clientCredentials = new ClientCredentials(
-            clientId: $authRequest->clientId,
-            clientSecret: $authRequest->clientSecret,
-            tokenEndpointAuthMethod: $authRequest->tokenEndpointAuthMethod
-        );
+    try {
+        $authRequest = AuthorizationRequest::fromArray($pendingFlow['authRequest']);
+    } catch (\InvalidArgumentException $e) {
+        $logger->error('Invalid authorization request data', ['error' => $e->getMessage()]);
+        unset($_SESSION['oauth_pending'][$serverId]);
+        redirectToMain(false, 'Invalid authorization request data');
+    }
 
-        $oauthConfig = new OAuthConfiguration(
-            tokenStorage: $tokenStorage,
-            clientCredentials: $clientCredentials
-        );
+    // Create OAuthConfiguration for the SDK
+    $tokenStorage = createTokenStorage();
+    $clientCredentials = new ClientCredentials(
+        clientId: $authRequest->clientId,
+        clientSecret: $authRequest->clientSecret,
+        tokenEndpointAuthMethod: $authRequest->tokenEndpointAuthMethod
+    );
 
-        $oauthClient = new OAuthClient($oauthConfig, $logger);
+    $oauthConfig = new OAuthConfiguration(
+        tokenStorage: $tokenStorage,
+        clientCredentials: $clientCredentials
+    );
 
-        // Exchange code for tokens using SDK
-        try {
-            $tokens = $oauthClient->exchangeCodeForTokens($authRequest, $code);
-            $logger->info('Tokens obtained successfully via SDK');
-            $resourceUrl = $authRequest->resourceUrl;
-        } catch (OAuthException $e) {
-            $logger->error('Token exchange failed: ' . $e->getMessage());
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, 'Token exchange failed: ' . $e->getMessage());
-        }
-    } else {
-        // Legacy format: manual token exchange (for backward compatibility)
-        $tokenEndpoint = $pendingFlow['tokenEndpoint'];
-        $verifier = $pendingFlow['verifier'];
-        $redirectUri = getCallbackUrl();
-        $clientId = $pendingFlow['clientId'];
-        $clientSecret = $pendingFlow['clientSecret'] ?? null;
-        $resourceUrl = $pendingFlow['resourceUrl'];
-        $issuer = $pendingFlow['issuer'] ?? null;
+    $oauthClient = new OAuthClient($oauthConfig, $logger);
 
-        // Build token request
-        $tokenParams = [
-            'grant_type' => 'authorization_code',
-            'code' => $code,
-            'redirect_uri' => $redirectUri,
-            'code_verifier' => $verifier,
-            'client_id' => $clientId,
-        ];
-
-        // Add resource indicator if available
-        if (isset($pendingFlow['resource'])) {
-            $tokenParams['resource'] = $pendingFlow['resource'];
-        }
-
-        // Add client secret if available (for client_secret_post)
-        if ($clientSecret !== null) {
-            $tokenParams['client_secret'] = $clientSecret;
-        }
-
-        $logger->debug('Exchanging code for tokens (legacy)', ['tokenEndpoint' => $tokenEndpoint]);
-
-        // Make token request
-        $ch = curl_init($tokenEndpoint);
-        if ($ch === false) {
-            throw new RuntimeException('Failed to initialize cURL for token request');
-        }
-
-        $headers = [
-            'Content-Type: application/x-www-form-urlencoded',
-            'Accept: application/json',
-        ];
-
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => http_build_query($tokenParams),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => $pendingFlow['verifyTls'] ?? true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-        ]);
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
-        curl_close($ch);
-
-        if ($response === false) {
-            $logger->error('Token request failed', ['error' => $curlError]);
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, "Token request failed: {$curlError}");
-        }
-
-        $tokenData = json_decode($response, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $logger->error('Invalid token response JSON', ['response' => $response]);
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, 'Invalid response from authorization server');
-        }
-
-        // Check for error in token response
-        if (isset($tokenData['error'])) {
-            $error = $tokenData['error'];
-            $description = $tokenData['error_description'] ?? $error;
-            $logger->error('Token endpoint error', ['error' => $error, 'description' => $description]);
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, $description);
-        }
-
-        if ($httpCode !== 200) {
-            $logger->error('Token request failed with HTTP error', ['httpCode' => $httpCode]);
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, "Token request failed with HTTP {$httpCode}");
-        }
-
-        if (!isset($tokenData['access_token'])) {
-            $logger->error('Token response missing access_token');
-            unset($_SESSION['oauth_pending'][$serverId]);
-            redirectToMain(false, 'Token response missing access_token');
-        }
-
-        $logger->info('Successfully obtained access token (legacy)');
-
-        // Create TokenSet from response
-        $tokens = TokenSet::fromTokenResponse($tokenData, $resourceUrl, $issuer);
-
-        // Store tokens
-        $tokenStorage = createTokenStorage();
-        $tokenStorage->store($resourceUrl, $tokens);
+    // Exchange code for tokens using SDK
+    try {
+        $tokens = $oauthClient->exchangeCodeForTokens($authRequest, $code);
+        $logger->info('Tokens obtained successfully via SDK');
+        $resourceUrl = $authRequest->resourceUrl;
+    } catch (OAuthException $e) {
+        $logger->error('Token exchange failed: ' . $e->getMessage());
+        unset($_SESSION['oauth_pending'][$serverId]);
+        redirectToMain(false, 'Token exchange failed: ' . $e->getMessage());
     }
 
     $logger->info('Tokens stored successfully');
