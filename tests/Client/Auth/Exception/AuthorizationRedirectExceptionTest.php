@@ -21,6 +21,7 @@ declare(strict_types=1);
 
 namespace Mcp\Tests\Client\Auth\Exception;
 
+use Mcp\Client\Auth\AuthorizationRequest;
 use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 use Mcp\Client\Auth\OAuthException;
 use PHPUnit\Framework\TestCase;
@@ -169,5 +170,100 @@ final class AuthorizationRedirectExceptionTest extends TestCase
         }
 
         $this->fail('Exception was not caught as OAuthException');
+    }
+
+    /**
+     * Test getAuthorizationRequest returns null when not provided.
+     */
+    public function testGetAuthorizationRequestDefaultsToNull(): void
+    {
+        $exception = new AuthorizationRedirectException(
+            'https://auth.example.com/authorize',
+            'state-123',
+            'https://app.example.com/callback'
+        );
+
+        $this->assertNull($exception->getAuthorizationRequest());
+    }
+
+    /**
+     * Test getAuthorizationRequest returns the attached request.
+     */
+    public function testGetAuthorizationRequestReturnsAttachedRequest(): void
+    {
+        $authRequest = new AuthorizationRequest(
+            authorizationUrl: 'https://auth.example.com/authorize?client_id=test',
+            state: 'state-123',
+            codeVerifier: 'verifier-abc',
+            redirectUri: 'https://app.example.com/callback',
+            resourceUrl: 'https://api.example.com/mcp',
+            resource: 'https://api.example.com',
+            tokenEndpoint: 'https://auth.example.com/token',
+            issuer: 'https://auth.example.com',
+            clientId: 'test-client',
+            clientSecret: null,
+            tokenEndpointAuthMethod: 'none'
+        );
+
+        $exception = new AuthorizationRedirectException(
+            'https://auth.example.com/authorize?client_id=test',
+            'state-123',
+            'https://app.example.com/callback',
+            'OAuth authorization requires browser redirect',
+            $authRequest
+        );
+
+        $this->assertSame($authRequest, $exception->getAuthorizationRequest());
+    }
+
+    /**
+     * Test that enriched exception values are consistent with attached AuthorizationRequest.
+     *
+     * Simulates the pattern used in OAuthClient::performAuthorizationFlow() where
+     * a caught AuthorizationRedirectException is re-thrown with an attached
+     * AuthorizationRequest built from the exception's own values.
+     */
+    public function testEnrichedExceptionConsistencyWithAuthorizationRequest(): void
+    {
+        // Simulate original exception thrown by a callback handler
+        $originalAuthUrl = 'https://auth.example.com/authorize?client_id=test&state=abc';
+        $originalState = 'abc';
+        $originalRedirectUri = 'https://app.example.com/callback';
+
+        $original = new AuthorizationRedirectException(
+            $originalAuthUrl,
+            $originalState,
+            $originalRedirectUri
+        );
+
+        // Simulate the enrichment done in OAuthClient::performAuthorizationFlow()
+        $enriched = new AuthorizationRedirectException(
+            authorizationUrl: $original->getAuthorizationUrl(),
+            state: $original->getState(),
+            redirectUri: $original->getRedirectUri(),
+            message: $original->getMessage(),
+            authorizationRequest: new AuthorizationRequest(
+                authorizationUrl: $original->getAuthorizationUrl(),
+                state: $original->getState(),
+                codeVerifier: 'pkce-verifier-xyz',
+                redirectUri: $original->getRedirectUri(),
+                resourceUrl: 'https://api.example.com/mcp',
+                resource: 'https://api.example.com',
+                tokenEndpoint: 'https://auth.example.com/token',
+                issuer: 'https://auth.example.com',
+                clientId: 'test-client',
+                clientSecret: null,
+                tokenEndpointAuthMethod: 'none'
+            )
+        );
+
+        $authRequest = $enriched->getAuthorizationRequest();
+        $this->assertNotNull($authRequest);
+
+        // The exception's top-level values and the AuthorizationRequest's
+        // values must be consistent — they describe the same redirect.
+        $this->assertSame($enriched->getAuthorizationUrl(), $authRequest->authorizationUrl);
+        $this->assertSame($enriched->getState(), $authRequest->state);
+        $this->assertSame($enriched->getRedirectUri(), $authRequest->redirectUri);
     }
 }

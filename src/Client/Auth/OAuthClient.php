@@ -696,17 +696,19 @@ class OAuthClient implements OAuthClientInterface
             $code = $callback->authorize($authUrl, $state);
         } catch (AuthorizationRedirectException $e) {
             // Enrich the exception with an AuthorizationRequest so callers
-            // have everything needed to complete the OAuth flow later
+            // have everything needed to complete the OAuth flow later.
+            // Use the exception's values (what the callback actually used)
+            // to ensure consistency between the redirect and token exchange.
             throw new AuthorizationRedirectException(
                 authorizationUrl: $e->getAuthorizationUrl(),
                 state: $e->getState(),
                 redirectUri: $e->getRedirectUri(),
                 message: $e->getMessage(),
                 authorizationRequest: new AuthorizationRequest(
-                    authorizationUrl: $authUrl,
-                    state: $state,
+                    authorizationUrl: $e->getAuthorizationUrl(),
+                    state: $e->getState(),
                     codeVerifier: $pkce['verifier'],
-                    redirectUri: $redirectUri,
+                    redirectUri: $e->getRedirectUri(),
                     resourceUrl: $resourceUrl,
                     resource: $resourceMetadata->resource,
                     tokenEndpoint: $asMetadata->tokenEndpoint,

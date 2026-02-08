@@ -278,13 +278,12 @@ class McpWebClient {
                 ];
             }
 
-            // Fallback: no AuthorizationRequest attached, use exception data directly
-            return [
-                'requiresOAuth' => true,
-                'authUrl' => $e->getAuthorizationUrl(),
-                'serverId' => $sessionId,
-                'message' => 'OAuth authorization required. Please authorize in the browser.',
-            ];
+            // No AuthorizationRequest attached — the OAuth callback flow cannot
+            // succeed without PKCE verifier and token endpoint data in session.
+            throw new RuntimeException(
+                'OAuth redirect received without AuthorizationRequest context. '
+                . 'Cannot complete authorization flow.'
+            );
 
         } catch (HttpAuthenticationException $e) {
             // Handle 401 with parsed WWW-Authenticate header
