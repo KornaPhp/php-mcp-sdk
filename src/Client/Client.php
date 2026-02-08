@@ -29,6 +29,7 @@ declare(strict_types=1);
 
 namespace Mcp\Client;
 
+use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 use Mcp\Client\Auth\OAuthConfiguration;
 use Mcp\Client\Transport\StdioServerParameters;
 use Mcp\Client\Transport\StdioTransport;
@@ -171,6 +172,8 @@ class Client {
             }
 
             return $this->session;
+        } catch (AuthorizationRedirectException $e) {
+            throw $e;
         } catch (\Exception $e) {
             $this->logger->error("Connection failed: {$e->getMessage()}");
             throw new RuntimeException("Connection failed: {$e->getMessage()}", 0, $e);

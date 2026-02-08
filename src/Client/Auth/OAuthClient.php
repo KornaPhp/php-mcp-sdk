@@ -692,7 +692,32 @@ class OAuthClient implements OAuthClientInterface
         // Execute authorization flow via callback handler
         // Note: For LoopbackCallbackHandler with auto-port, the handler will replace
         // the {PORT} placeholder in the auth URL with the actual port
-        $code = $callback->authorize($authUrl, $state);
+        try {
+            $code = $callback->authorize($authUrl, $state);
+        } catch (AuthorizationRedirectException $e) {
+            // Enrich the exception with an AuthorizationRequest so callers
+            // have everything needed to complete the OAuth flow later
+            throw new AuthorizationRedirectException(
+                authorizationUrl: $e->getAuthorizationUrl(),
+                state: $e->getState(),
+                redirectUri: $e->getRedirectUri(),
+                message: $e->getMessage(),
+                authorizationRequest: new AuthorizationRequest(
+                    authorizationUrl: $authUrl,
+                    state: $state,
+                    codeVerifier: $pkce['verifier'],
+                    redirectUri: $redirectUri,
+                    resourceUrl: $resourceUrl,
+                    resource: $resourceMetadata->resource,
+                    tokenEndpoint: $asMetadata->tokenEndpoint,
+                    issuer: $asMetadata->issuer,
+                    clientId: $credentials->clientId,
+                    clientSecret: $credentials->clientSecret,
+                    tokenEndpointAuthMethod: $credentials->tokenEndpointAuthMethod,
+                    resourceMetadataUrl: null
+                )
+            );
+        }
 
         // Get the actual redirect URI used (important for auto-port loopback handler)
         // After authorize() completes, the handler knows the actual port that was used

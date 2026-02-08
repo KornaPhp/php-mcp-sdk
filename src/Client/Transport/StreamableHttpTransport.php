@@ -29,6 +29,7 @@ namespace Mcp\Client\Transport;
 use Mcp\Client\Auth\Discovery\MetadataDiscovery;
 use Mcp\Client\Auth\OAuthClient;
 use Mcp\Client\Auth\OAuthClientInterface;
+use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 use Mcp\Client\Auth\OAuthException;
 use Mcp\Client\Auth\Token\TokenSet;
 use Mcp\Client\Transport\HttpAuthenticationException;
@@ -323,6 +324,8 @@ class StreamableHttpTransport
                     $this->oauthClient->handleUnauthorized($endpoint, $wwwAuth);
                     // Retry the request with the new token
                     return $this->sendMessageWithOAuthRetry($message, $attempt + 1);
+                } catch (AuthorizationRedirectException $e) {
+                    throw $e;
                 } catch (OAuthException $e) {
                     $this->logger->error("OAuth authorization failed: {$e->getMessage()}");
                     throw new RuntimeException("OAuth authorization failed: {$e->getMessage()}", 0, $e);
@@ -342,6 +345,8 @@ class StreamableHttpTransport
                             $this->oauthClient->handleInsufficientScope($endpoint, $wwwAuth, $tokens);
                             // Retry the request with the new token
                             return $this->sendMessageWithOAuthRetry($message, $attempt + 1);
+                        } catch (AuthorizationRedirectException $e) {
+                            throw $e;
                         } catch (OAuthException $e) {
                             $this->logger->error("OAuth step-up authorization failed: {$e->getMessage()}");
                             throw new RuntimeException("OAuth step-up failed: {$e->getMessage()}", 0, $e);

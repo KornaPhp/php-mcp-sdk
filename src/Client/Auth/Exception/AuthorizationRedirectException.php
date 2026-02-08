@@ -25,6 +25,7 @@ declare(strict_types=1);
 
 namespace Mcp\Client\Auth\Exception;
 
+use Mcp\Client\Auth\AuthorizationRequest;
 use Mcp\Client\Auth\OAuthException;
 
 /**
@@ -53,23 +54,31 @@ class AuthorizationRedirectException extends OAuthException
     public readonly string $redirectUri;
 
     /**
+     * The authorization request containing all data needed for token exchange.
+     */
+    private ?AuthorizationRequest $authorizationRequest;
+
+    /**
      * Create a new AuthorizationRedirectException.
      *
      * @param string $authorizationUrl The URL to redirect the user to
      * @param string $state The state parameter for CSRF protection
      * @param string $redirectUri The redirect URI for the callback
      * @param string $message Optional custom message
+     * @param AuthorizationRequest|null $authorizationRequest Optional authorization request with full context
      */
     public function __construct(
         string $authorizationUrl,
         string $state,
         string $redirectUri,
-        string $message = 'OAuth authorization requires browser redirect'
+        string $message = 'OAuth authorization requires browser redirect',
+        ?AuthorizationRequest $authorizationRequest = null
     ) {
         parent::__construct($message);
         $this->authorizationUrl = $authorizationUrl;
         $this->state = $state;
         $this->redirectUri = $redirectUri;
+        $this->authorizationRequest = $authorizationRequest;
     }
 
     /**
@@ -100,5 +109,15 @@ class AuthorizationRedirectException extends OAuthException
     public function getRedirectUri(): string
     {
         return $this->redirectUri;
+    }
+
+    /**
+     * Get the authorization request.
+     *
+     * @return AuthorizationRequest|null
+     */
+    public function getAuthorizationRequest(): ?AuthorizationRequest
+    {
+        return $this->authorizationRequest;
     }
 }

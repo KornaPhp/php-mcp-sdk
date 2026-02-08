@@ -46,6 +46,7 @@ declare(strict_types=1);
 
 use Monolog\Logger;
 use Mcp\Client\Client;
+use Mcp\Client\Auth\Exception\AuthorizationRedirectException;
 use Mcp\Client\Transport\HttpAuthenticationException;
 use Mcp\Client\Transport\StreamableHttpTransport;
 use Mcp\Client\Auth\OAuthConfiguration;
@@ -252,6 +253,37 @@ class McpWebClient {
                 'sessionId' => $sessionId,
                 'capabilities' => $initResult->capabilities,
                 'type' => 'http'
+            ];
+
+        } catch (AuthorizationRedirectException $e) {
+            // SDK's OAuth flow threw a redirect exception — extract the
+            // AuthorizationRequest and store it for oauth_callback.php
+            $this->logger->info('OAuth redirect required during connect', ['url' => $url]);
+
+            $authRequest = $e->getAuthorizationRequest();
+            if ($authRequest !== null) {
+                $_SESSION['oauth_pending'][$sessionId] = [
+                    'authRequest' => $authRequest->toArray(),
+                    'httpConfig' => $httpConfig,
+                    'oauthConfig' => $oauthConfig,
+                    'verifyTls' => $httpConfig['verifyTls'] ?? true,
+                    'startedAt' => time(),
+                ];
+
+                return [
+                    'requiresOAuth' => true,
+                    'authUrl' => $authRequest->authorizationUrl,
+                    'serverId' => $sessionId,
+                    'message' => 'OAuth authorization required. Please authorize in the browser.',
+                ];
+            }
+
+            // Fallback: no AuthorizationRequest attached, use exception data directly
+            return [
+                'requiresOAuth' => true,
+                'authUrl' => $e->getAuthorizationUrl(),
+                'serverId' => $sessionId,
+                'message' => 'OAuth authorization required. Please authorize in the browser.',
             ];
 
         } catch (HttpAuthenticationException $e) {
