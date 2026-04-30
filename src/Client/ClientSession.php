@@ -107,6 +107,9 @@ class ClientSession extends BaseSession {
     /** @var bool Whether to auto-fill schema defaults on accept responses. */
     private bool $elicitationApplyDefaults = false;
 
+    /** @var bool Whether the registered handler is prepared to handle URL-mode requests (2025-11-25). */
+    private bool $elicitationSupportsUrlMode = false;
+
     /**
      * ClientSession constructor.
      *
@@ -285,9 +288,15 @@ class ClientSession extends BaseSession {
      * missing fields in the returned content are populated from the schema's
      * per-property `default` values before the response is sent back.
      *
+     * When $supportsUrlMode is true the client advertises the `url` sub-capability
+     * (MCP 2025-11-25) alongside `form`, so spec-compliant servers may send
+     * URL-mode elicitation/create requests. The handler is responsible for
+     * inspecting `$request->mode` and presenting the URL flow appropriately.
+     * Default is false: only form-mode requests will be sent by compliant servers.
+     *
      * @param callable(ElicitationCreateRequest): ElicitationCreateResult $handler
      */
-    public function onElicit(callable $handler, bool $applyDefaults = false): void {
+    public function onElicit(callable $handler, bool $applyDefaults = false, bool $supportsUrlMode = false): void {
         if ($this->initialized && !$this->isRestored) {
             throw new RuntimeException('onElicit() must be called before initialize()');
         }
@@ -296,6 +305,7 @@ class ClientSession extends BaseSession {
         }
         $this->elicitationHandler = $handler;
         $this->elicitationApplyDefaults = $applyDefaults;
+        $this->elicitationSupportsUrlMode = $supportsUrlMode;
 
         $this->onRequest(function (RequestResponder $responder) use ($applyDefaults): void {
             $wrapper = $responder->getRequest();
@@ -331,13 +341,17 @@ class ClientSession extends BaseSession {
      * Build the ClientCapabilities advertised at initialization time.
      *
      * Advertises elicitation support only when a handler is registered;
-     * the `applyDefaults` flag is included only when the caller opted in.
+     * `form` is always advertised when registering a handler (today's SDK
+     * always supports inline form responses), and `url` is added only when
+     * the caller opted in via $supportsUrlMode. The `applyDefaults` flag is
+     * included only when the caller opted in.
      */
     private function buildClientCapabilities(): ClientCapabilities {
         $elicitation = null;
         if ($this->elicitationHandler !== null) {
             $elicitation = new ElicitationCapability(
                 form: true,
+                url: $this->elicitationSupportsUrlMode ? true : null,
                 applyDefaults: $this->elicitationApplyDefaults ? true : null,
             );
         }

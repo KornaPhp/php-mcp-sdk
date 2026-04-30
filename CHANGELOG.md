@@ -14,6 +14,21 @@ This file was introduced during the v1.7.x series. Structured entries below cove
 **v1.6.0 and later**; earlier releases can be reviewed via the
 [Git tag history](https://github.com/logiscape/mcp-sdk-php/tags).
 
+## [Unreleased]
+
+### Added
+
+- Client side documentation guide
+- `ClientSession::onElicit()` and `Client::onElicit()` accept a new
+  `supportsUrlMode` parameter (default `false`) that opts the client into
+  advertising the `url` sub-capability for elicitation, alongside `form`.
+  Without this flag spec-compliant servers will only send form-mode
+  elicitation/create requests; the dispatch path for URL mode requests was
+  already in place but unreachable in practice.
+
+### Changed
+- Updated CI GitHub action for Node.js 24
+
 ## [1.7.1]
 
 ### Added

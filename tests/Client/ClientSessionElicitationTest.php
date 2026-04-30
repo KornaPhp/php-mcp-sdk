@@ -85,6 +85,87 @@ final class ClientSessionElicitationTest extends TestCase
         $this->assertTrue($capabilities['elicitation']['applyDefaults']);
     }
 
+    public function testCapabilityOmitsUrlByDefault(): void
+    {
+        // Per MCP 2025-11-25, omitting `url` means the client only supports
+        // form-mode elicitation; spec-compliant servers will not send URL-mode
+        // elicitation/create requests to this client.
+        $session = $this->makeInitializedSession(
+            static fn() => new ElicitationCreateResult('decline'),
+            false,
+            $writeStream
+        );
+        $this->assertInstanceOf(ClientSession::class, $session);
+        $capabilities = $this->extractInitCapabilities($writeStream);
+        $this->assertArrayHasKey('elicitation', $capabilities);
+        $this->assertArrayHasKey('form', $capabilities['elicitation']);
+        $this->assertArrayNotHasKey('url', $capabilities['elicitation']);
+    }
+
+    public function testCapabilityAdvertisesUrlWhenOptedIn(): void
+    {
+        // Opting in via $supportsUrlMode adds the `url` sub-capability so
+        // 2025-11-25 servers may send URL-mode requests. `form` is still
+        // advertised because the SDK always supports inline form responses
+        // through the registered handler.
+        $session = $this->makeInitializedSession(
+            static fn() => new ElicitationCreateResult('accept'),
+            false,
+            $writeStream,
+            supportsUrlMode: true
+        );
+        $this->assertInstanceOf(ClientSession::class, $session);
+        $capabilities = $this->extractInitCapabilities($writeStream);
+        $this->assertArrayHasKey('elicitation', $capabilities);
+        $this->assertArrayHasKey('form', $capabilities['elicitation']);
+        $this->assertArrayHasKey('url', $capabilities['elicitation']);
+    }
+
+    public function testCapabilityAdvertisesUrlAndApplyDefaultsTogether(): void
+    {
+        $session = $this->makeInitializedSession(
+            static fn() => new ElicitationCreateResult('accept', []),
+            true,
+            $writeStream,
+            supportsUrlMode: true
+        );
+        $this->assertInstanceOf(ClientSession::class, $session);
+        $capabilities = $this->extractInitCapabilities($writeStream);
+        $this->assertArrayHasKey('form', $capabilities['elicitation']);
+        $this->assertArrayHasKey('url', $capabilities['elicitation']);
+        $this->assertTrue($capabilities['elicitation']['applyDefaults']);
+    }
+
+    public function testUrlModeRequestRoutesToHandler(): void
+    {
+        $captured = null;
+        $handler = static function (ElicitationCreateRequest $request) use (&$captured): ElicitationCreateResult {
+            $captured = $request;
+            return new ElicitationCreateResult('accept');
+        };
+
+        $session = $this->makeInitializedSession($handler, false, $writeStream, supportsUrlMode: true);
+        $this->drainInitMessages($writeStream);
+
+        $session->dispatchIncomingMessage($this->makeUrlElicitationRequest(
+            id: 11,
+            url: 'https://example.com/auth?eid=abc',
+            elicitationId: 'abc',
+            message: 'Authorize access to continue.'
+        ));
+
+        $this->assertInstanceOf(ElicitationCreateRequest::class, $captured);
+        $this->assertSame('url', $captured->mode);
+        $this->assertSame('https://example.com/auth?eid=abc', $captured->url);
+        $this->assertSame('abc', $captured->elicitationId);
+
+        $response = $this->receiveResponse($writeStream);
+        $this->assertSame(11, $response['id']);
+        $this->assertSame('accept', $response['result']['action']);
+        // URL-mode accept responses must not carry a content payload.
+        $this->assertArrayNotHasKey('content', $response['result']);
+    }
+
     public function testOnElicitRejectsPostInitCall(): void
     {
         $session = $this->makeInitializedSession(null, false, $writeStream);
@@ -307,7 +388,8 @@ final class ClientSessionElicitationTest extends TestCase
     private function makeInitializedSession(
         ?callable $handler,
         bool $applyDefaults,
-        ?MemoryStream &$writeStream
+        ?MemoryStream &$writeStream,
+        bool $supportsUrlMode = false
     ): ClientSession {
         $readStream = new MemoryStream();
         $writeStream = new MemoryStream();
@@ -324,7 +406,7 @@ final class ClientSessionElicitationTest extends TestCase
 
         $session = new ClientSession($readStream, $writeStream, readTimeout: 2.0);
         if ($handler !== null) {
-            $session->onElicit($handler, $applyDefaults);
+            $session->onElicit($handler, $applyDefaults, $supportsUrlMode);
         }
         $session->initialize();
 
@@ -386,6 +468,26 @@ final class ClientSessionElicitationTest extends TestCase
         $params = new \Mcp\Types\RequestParams();
         $params->message = 'please accept with defaults';
         $params->requestedSchema = $requestedSchema;
+
+        return new JsonRpcMessage(new JSONRPCRequest(
+            jsonrpc: '2.0',
+            id: new RequestId($id),
+            params: $params,
+            method: 'elicitation/create'
+        ));
+    }
+
+    private function makeUrlElicitationRequest(
+        int $id,
+        string $url,
+        string $elicitationId,
+        string $message
+    ): JsonRpcMessage {
+        $params = new \Mcp\Types\RequestParams();
+        $params->message = $message;
+        $params->mode = 'url';
+        $params->url = $url;
+        $params->elicitationId = $elicitationId;
 
         return new JsonRpcMessage(new JSONRPCRequest(
             jsonrpc: '2.0',

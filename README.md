@@ -66,6 +66,8 @@ Save this as `example_server.php`
 
 ### Creating an MCP Client
 
+For detailed documentation and examples of MCP clients, see the [Client Development Guide](docs/client-dev.md).
+
 Here's how to create a client that connects to the example server and calls the addition tool:
 
 ```php

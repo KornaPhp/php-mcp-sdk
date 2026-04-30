@@ -69,6 +69,9 @@ class Client {
     /** @var bool Whether the pending elicitation handler opted into applyDefaults. */
     private bool $pendingElicitationApplyDefaults = false;
 
+    /** @var bool Whether the pending elicitation handler opted into URL-mode advertisement. */
+    private bool $pendingElicitationSupportsUrlMode = false;
+
     /**
      * Client constructor.
      *
@@ -86,14 +89,19 @@ class Client {
      * initialization handshake. The handler is applied to the session that
      * connect() creates.
      *
+     * Set $supportsUrlMode to true to advertise the `url` sub-capability
+     * (MCP 2025-11-25) in addition to `form`. When false (the default),
+     * spec-compliant servers will only send form-mode requests.
+     *
      * @param callable(\Mcp\Types\ElicitationCreateRequest): \Mcp\Types\ElicitationCreateResult $handler
      */
-    public function onElicit(callable $handler, bool $applyDefaults = false): void {
+    public function onElicit(callable $handler, bool $applyDefaults = false, bool $supportsUrlMode = false): void {
         if ($this->session !== null) {
             throw new RuntimeException('onElicit() must be called before connect()');
         }
         $this->pendingElicitationHandler = $handler;
         $this->pendingElicitationApplyDefaults = $applyDefaults;
+        $this->pendingElicitationSupportsUrlMode = $supportsUrlMode;
     }
 
     /**
@@ -204,7 +212,8 @@ class Client {
             if ($this->pendingElicitationHandler !== null) {
                 $this->session->onElicit(
                     $this->pendingElicitationHandler,
-                    $this->pendingElicitationApplyDefaults
+                    $this->pendingElicitationApplyDefaults,
+                    $this->pendingElicitationSupportsUrlMode
                 );
             }
 
@@ -353,7 +362,8 @@ class Client {
             if ($this->pendingElicitationHandler !== null) {
                 $this->session->onElicit(
                     $this->pendingElicitationHandler,
-                    $this->pendingElicitationApplyDefaults
+                    $this->pendingElicitationApplyDefaults,
+                    $this->pendingElicitationSupportsUrlMode
                 );
             }
 
