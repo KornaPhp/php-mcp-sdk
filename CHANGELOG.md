@@ -28,6 +28,7 @@ This file was introduced during the v1.7.x series. Structured entries below cove
 
 ### Changed
 - Updated CI GitHub action for Node.js 24
+- ElicitationCompleteNotification moved to the correct union type
 
 ## [1.7.1]
 

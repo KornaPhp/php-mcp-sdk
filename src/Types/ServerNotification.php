@@ -39,6 +39,8 @@ namespace Mcp\Types;
  *   | PromptListChangedNotification
  *   | ToolListChangedNotification
  *   | LoggingMessageNotification
+ *   | TaskStatusNotification
+ *   | ElicitationCompleteNotification
  *
  * This acts as a root model holding one valid Notification variant and provides
  * a factory method to construct the correct variant from method and params.
@@ -57,7 +59,8 @@ class ServerNotification implements McpModel {
             $notification instanceof PromptListChangedNotification ||
             $notification instanceof ToolListChangedNotification ||
             $notification instanceof LoggingMessageNotification ||
-            $notification instanceof TaskStatusNotification
+            $notification instanceof TaskStatusNotification ||
+            $notification instanceof ElicitationCompleteNotification
         )) {
             throw new \InvalidArgumentException('Invalid server notification type');
         }
@@ -82,6 +85,7 @@ class ServerNotification implements McpModel {
             'notifications/tools/list_changed' => self::createToolListChangedNotification($params),
             'notifications/message' => self::createLoggingMessageNotification($params),
             'notifications/tasks/status' => self::createTaskStatusNotification($params),
+            'notifications/elicitation/complete' => self::createElicitationCompleteNotification($params),
             default => throw new \InvalidArgumentException("Unknown server notification method: $method")
         };
     }
@@ -237,6 +241,16 @@ class ServerNotification implements McpModel {
             $notifParams->$k = $v;
         }
         return new self(new TaskStatusNotification($notifParams));
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     */
+    private static function createElicitationCompleteNotification(array $params): self {
+        if (empty($params['elicitationId'])) {
+            throw new \InvalidArgumentException('ElicitationCompleteNotification requires "elicitationId"');
+        }
+        return new self(new ElicitationCompleteNotification($params['elicitationId']));
     }
 
     public function validate(): void {

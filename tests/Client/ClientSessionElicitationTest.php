@@ -22,16 +22,20 @@ namespace Mcp\Tests\Client;
 use Mcp\Client\ClientSession;
 use Mcp\Shared\MemoryStream;
 use Mcp\Shared\Version;
+use Mcp\Types\ElicitationCompleteNotification;
 use Mcp\Types\ElicitationCreateRequest;
 use Mcp\Types\ElicitationCreateResult;
 use Mcp\Types\Implementation;
 use Mcp\Types\InitializeResult;
 use Mcp\Types\JSONRPCError;
+use Mcp\Types\JSONRPCNotification;
 use Mcp\Types\JSONRPCRequest;
 use Mcp\Types\JSONRPCResponse;
 use Mcp\Types\JsonRpcMessage;
+use Mcp\Types\NotificationParams;
 use Mcp\Types\RequestId;
 use Mcp\Types\ServerCapabilities;
+use Mcp\Types\ServerNotification;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -331,6 +335,38 @@ final class ClientSessionElicitationTest extends TestCase
         $this->assertSame('accept', $response['result']['action']);
         // Without applyDefaults, the SDK must not mutate content — stays empty.
         $this->assertSame([], $response['result']['content']);
+    }
+
+    public function testElicitationCompleteNotificationDeliveredToHandler(): void
+    {
+        // notifications/elicitation/complete is server -> client per the
+        // 2025-11-25 spec. ServerNotification::fromMethodAndParams() must
+        // decode it so a registered onNotification handler receives the
+        // typed ElicitationCompleteNotification instead of crashing the
+        // session's receive path with "Unknown server notification method".
+        $session = $this->makeInitializedSession(
+            static fn() => new ElicitationCreateResult('accept'),
+            false,
+            $writeStream,
+            supportsUrlMode: true
+        );
+        $this->drainInitMessages($writeStream);
+
+        $captured = null;
+        $session->onNotification(static function (ServerNotification $wrapper) use (&$captured): void {
+            $captured = $wrapper->getNotification();
+        });
+
+        $params = new NotificationParams();
+        $params->elicitationId = 'eli-123';
+        $session->dispatchIncomingMessage(new JsonRpcMessage(new JSONRPCNotification(
+            jsonrpc: '2.0',
+            params: $params,
+            method: 'notifications/elicitation/complete'
+        )));
+
+        $this->assertInstanceOf(ElicitationCompleteNotification::class, $captured);
+        $this->assertSame('eli-123', $captured->elicitationId);
     }
 
     public function testHandlerErrorIsReportedAsJsonRpcError(): void
